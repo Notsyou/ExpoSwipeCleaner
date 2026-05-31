@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { StyleSheet, Text, View, Alert, StatusBar, Animated } from 'react-native';
+import { StyleSheet, Text, View, Alert, StatusBar, Animated, TouchableOpacity } from 'react-native';
 import { Image } from 'expo-image';
 import { BlurView } from 'expo-blur';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -7,10 +7,10 @@ import * as MediaLibrary from 'expo-media-library';
 import Swiper from 'react-native-deck-swiper';
 import { Ionicons } from '@expo/vector-icons';
 import { Audio } from 'expo-av';
+import { useVideoPlayer, VideoView } from 'expo-video';
 import * as Haptics from 'expo-haptics';
 // SDK 54+: legacy sub-path keeps the same API without deprecation throws
 import * as FileSystem from 'expo-file-system/legacy';
-import { File } from 'expo-file-system';
 
 // Components & Constants
 import TrashReviewModal from './components/TrashReviewModal';
@@ -30,10 +30,32 @@ const TRASH_WAV_B64 = 'UklGRgomAABXQVZFZm10IBAAAAABAAEAIlYAAESsAAACABAAZGF0YeYlA
 const VIGNETTE_WIDTH = SCREEN_WIDTH * 0.35;
 
 // ─── StoragePill ──────────────────────────────────────────────────────────────
-const StoragePill = ({ savedBytes }) => (
-  <BlurView intensity={50} tint="dark" style={styles.storagePill}>
-    <Ionicons name="cloud-done-outline" size={13} color="rgba(255,255,255,0.55)" />
-    <Text style={styles.storageText}>{(savedBytes / (1024 * 1024)).toFixed(1)} MB saved</Text>
+// FIX #6: Hide pill when no bytes saved yet
+const StoragePill = ({ savedBytes }) => {
+  if (savedBytes === 0) return null;
+  return (
+    <BlurView intensity={50} tint="dark" style={styles.storagePill}>
+      <Ionicons name="cloud-done-outline" size={13} color="rgba(255,255,255,0.55)" />
+      <Text style={styles.storageText}>{(savedBytes / (1024 * 1024)).toFixed(1)} MB saved</Text>
+    </BlurView>
+  );
+};
+
+// ─── MediaToggle ──────────────────────────────────────────────────────────────
+const MediaToggle = ({ mode, onChange }) => (
+  <BlurView intensity={50} tint="dark" style={styles.togglePill}>
+    <View style={styles.toggleTrack}>
+      <View style={[styles.toggleThumb, mode === 'video' && styles.toggleThumbRight]} />
+      {['photo', 'video'].map((m) => (
+        <Text
+          key={m}
+          onPress={() => onChange(m)}
+          style={[styles.toggleLabel, mode === m && styles.toggleLabelActive]}
+        >
+          {m === 'photo' ? 'Photos' : 'Videos'}
+        </Text>
+      ))}
+    </View>
   </BlurView>
 );
 
@@ -58,12 +80,24 @@ const EdgeVignette = ({ side, color, opacity }) => {
   );
 };
 
-// ─── App ──────────────────────────────────────────────────────────────────────
 export default function App() {
   const [hasPermission, setHasPermission] = useState(null);
+  const [mediaMode, setMediaMode] = useState('photo'); // 'photo' | 'video'
+  const mediaModeRef = useRef('photo');
+
+  // ── Photo state ────────────────────────────────────────────────────────────
   const [photos, setPhotos] = useState([]);
   const [trashQueue, setTrashQueue] = useState([]);
   const [trashSizeBytes, setTrashSizeBytes] = useState(0);
+
+  // ── Video state ────────────────────────────────────────────────────────────
+  const [videos, setVideos] = useState([]);
+  const [videoTrashQueue, setVideoTrashQueue] = useState([]);
+  const [videoTrashSizeBytes, setVideoTrashSizeBytes] = useState(0);
+  const [videoHasNextPage, setVideoHasNextPage] = useState(true);
+  const [videoEndCursor, setVideoEndCursor] = useState(null);
+  const loadingMoreVideosRef = useRef(false);
+
   const [reviewVisible, setReviewVisible] = useState(false);
 
   const swiperRef = useRef(null);
@@ -75,11 +109,31 @@ export default function App() {
   const [cardIndex, setCardIndex] = useState(0);
   const cardIndexRef = useRef(0);
 
+  const [videoSwipeHistory, setVideoSwipeHistory] = useState([]);
+  const videoSwipeHistoryRef = useRef([]);
+  const [videoCardIndex, setVideoCardIndex] = useState(0);
+  const videoCardIndexRef = useRef(0);
+
   const activeAssetInfoRef = useRef(null);
 
   const [hasNextPage, setHasNextPage] = useState(true);
   const [endCursor, setEndCursor] = useState(null);
   const loadingMoreRef = useRef(false);
+
+  // FIX #2 & #3: Mirror pagination state into refs so callbacks always see current values
+  const hasNextPageRef = useRef(true);
+  const videoHasNextPageRef = useRef(true);
+  const endCursorRef = useRef(null);
+  const videoEndCursorRef = useRef(null);
+  const photosLengthRef = useRef(0);
+  const videosLengthRef = useRef(0);
+
+  useEffect(() => { hasNextPageRef.current = hasNextPage; }, [hasNextPage]);
+  useEffect(() => { videoHasNextPageRef.current = videoHasNextPage; }, [videoHasNextPage]);
+  useEffect(() => { endCursorRef.current = endCursor; }, [endCursor]);
+  useEffect(() => { videoEndCursorRef.current = videoEndCursor; }, [videoEndCursor]);
+  useEffect(() => { photosLengthRef.current = photos.length; }, [photos]);
+  useEffect(() => { videosLengthRef.current = videos.length; }, [videos]);
 
   const trashOpacity = useRef(new Animated.Value(0)).current;
   const keepOpacity  = useRef(new Animated.Value(0)).current;
@@ -88,9 +142,44 @@ export default function App() {
   const keepSoundRef  = useRef(null);
   const trashSoundRef = useRef(null);
 
+  // ── Shared video player ────────────────────────────────────────────────────
+  // One player instance for the whole video tab. Source is swapped on each swipe.
+  // This avoids the isActive prop sync problem entirely.
+  const videoPlayer = useVideoPlayer(null, (p) => {
+    p.loop = true;
+    p.volume = 0; // start muted until user unmutes
+  });
+
+  // Mute state for video playback
+  const [isMuted, setIsMuted] = useState(true);
+  const isMutedRef = useRef(true);
+  const toggleMute = useCallback(() => {
+    setIsMuted(prev => {
+      const next = !prev;
+      isMutedRef.current = next;
+      videoPlayer.volume = next ? 0 : 1;
+      return next;
+    });
+  }, [videoPlayer]);
+
   // Sync refs
   useEffect(() => { swipeHistoryRef.current = swipeHistory; }, [swipeHistory]);
   useEffect(() => { cardIndexRef.current = cardIndex; }, [cardIndex]);
+  useEffect(() => { videoSwipeHistoryRef.current = videoSwipeHistory; }, [videoSwipeHistory]);
+  useEffect(() => { videoCardIndexRef.current = videoCardIndex; }, [videoCardIndex]);
+
+  // Seed the shared player with the current frontmost video whenever:
+  // - the video list first loads, or
+  // - the user switches to the video tab
+  useEffect(() => {
+    if (mediaMode !== 'video') return;
+    const frontVideo = videos[videoCardIndex];
+    if (!frontVideo?.uri) return;
+    videoPlayer.replaceAsync({ uri: frontVideo.uri }).then(() => {
+      videoPlayer.volume = isMutedRef.current ? 0 : 1;
+      videoPlayer.play();
+    }).catch(() => {});
+  }, [mediaMode, videos.length > 0]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Load sounds ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -102,14 +191,17 @@ export default function App() {
         const keepUri  = FileSystem.cacheDirectory + 'swipe_keep.wav';
         const trashUri = FileSystem.cacheDirectory + 'swipe_trash.wav';
 
-        // SDK 54: use new File class to check existence instead of getInfoAsync
-        const keepFile  = new File(keepUri);
-        const trashFile = new File(trashUri);
+        // FIX #1: Use legacy getInfoAsync instead of new File class .exists
+        // (File.exists is not reliably async-compatible across SDK versions)
+        const [keepInfo, trashInfo] = await Promise.all([
+          FileSystem.getInfoAsync(keepUri),
+          FileSystem.getInfoAsync(trashUri),
+        ]);
 
-        if (!await keepFile.exists) {
-          await FileSystem.writeAsStringAsync(keepUri,  KEEP_WAV_B64,  { encoding: FileSystem.EncodingType.Base64 });
+        if (!keepInfo.exists) {
+          await FileSystem.writeAsStringAsync(keepUri, KEEP_WAV_B64, { encoding: FileSystem.EncodingType.Base64 });
         }
-        if (!await trashFile.exists) {
+        if (!trashInfo.exists) {
           await FileSystem.writeAsStringAsync(trashUri, TRASH_WAV_B64, { encoding: FileSystem.EncodingType.Base64 });
         }
 
@@ -150,12 +242,16 @@ export default function App() {
     (async () => {
       const { status } = await MediaLibrary.requestPermissionsAsync();
       setHasPermission(status === 'granted');
-      if (status === 'granted') loadMorePhotos();
+      if (status === 'granted') {
+        loadMorePhotos();
+        loadMoreVideos();
+      }
     })();
   }, []);
 
+  // FIX #3: loadMorePhotos uses ref for hasNextPage guard, not stale closure state
   const loadMorePhotos = useCallback(async (cursor = null) => {
-    if (!hasNextPage && cursor !== null) return;
+    if (!hasNextPageRef.current && cursor !== null) return;
     if (loadingMoreRef.current) return;
     loadingMoreRef.current = true;
     try {
@@ -166,49 +262,151 @@ export default function App() {
       setPhotos(prev => [...prev, ...media.assets]);
       setEndCursor(media.endCursor);
       setHasNextPage(media.hasNextPage);
+      hasNextPageRef.current = media.hasNextPage;
+      endCursorRef.current = media.endCursor;
       Image.prefetch(media.assets.slice(0, PREFETCH_BATCH).map(a => a.uri));
     } finally {
       loadingMoreRef.current = false;
     }
-  }, [hasNextPage]);
+  }, []);
 
-  const resetOverlays = () => {
+  // FIX #3: loadMoreVideos uses ref for videoHasNextPage guard
+  const loadMoreVideos = useCallback(async (cursor = null) => {
+    if (!videoHasNextPageRef.current && cursor !== null) return;
+    if (loadingMoreVideosRef.current) return;
+    loadingMoreVideosRef.current = true;
+    try {
+      const media = await MediaLibrary.getAssetsAsync({
+        first: PAGE_SIZE, mediaType: 'video',
+        sortBy: [[MediaLibrary.SortBy.creationTime, false]], after: cursor,
+      });
+      setVideos(prev => [...prev, ...media.assets]);
+      setVideoEndCursor(media.endCursor);
+      setVideoHasNextPage(media.hasNextPage);
+      videoHasNextPageRef.current = media.hasNextPage;
+      videoEndCursorRef.current = media.endCursor;
+    } finally {
+      loadingMoreVideosRef.current = false;
+    }
+  }, []);
+
+  const resetOverlays = useCallback(() => {
     Animated.parallel([
       Animated.timing(trashOpacity, { toValue: 0, duration: 0, useNativeDriver: true }),
       Animated.timing(keepOpacity,  { toValue: 0, duration: 0, useNativeDriver: true }),
     ]).start();
-  };
+  }, [trashOpacity, keepOpacity]);
 
-  const handleSwipeLeft = (index) => {
-    const photo = photos[index];
-    if (!photo?.id) return;
-    const fileSize = activeAssetInfoRef.current?.fileSize ?? 0;
-    setTrashQueue(prev => [...prev, photo.id]);
-    setSwipeHistory(prev => [...prev, { dir: 'left', assetId: photo.id, fileSize }]);
-    setTrashSizeBytes(prev => prev + fileSize);
-    playTrash();
-  };
+  const handleModeChange = useCallback((m) => {
+    mediaModeRef.current = m;
+    setMediaMode(m);
+    Animated.parallel([
+      Animated.timing(trashOpacity, { toValue: 0, duration: 0, useNativeDriver: true }),
+      Animated.timing(keepOpacity,  { toValue: 0, duration: 0, useNativeDriver: true }),
+    ]).start();
+  }, [trashOpacity, keepOpacity]);
 
-  const handleSwipeRight = (index) => {
-    setSwipeHistory(prev => [...prev, { dir: 'right', assetId: photos[index]?.id, fileSize: 0 }]);
-    playKeep();
-  };
+  // FIX #4 & #5: Use refs for asset lookup and track trim offset to prevent
+  // index drift between swiper internal counter and our asset arrays.
+  const photoTrimOffsetRef = useRef(0);
+  const videoTrimOffsetRef = useRef(0);
 
-  const handleSwiped = (index) => {
-    setCardIndex(index + 1);
-    resetOverlays();
-    if (hasNextPage && photos.length - (index + 1) <= LOAD_AHEAD_THRESHOLD) loadMorePhotos(endCursor);
-    if ((index + 1) >= TRIM_CHUNK && photos.length > MAX_PHOTOS_IN_MEMORY) {
-      setPhotos(prev => prev.slice(TRIM_CHUNK));
-      setCardIndex(prev => {
-        const next = Math.max(0, prev - TRIM_CHUNK);
-        swiperRef.current?.jumpToCardIndex?.(next);
-        return next;
+  // FIX #7: Wrap all swipe handlers in useCallback with stable deps (refs only)
+  const handleSwipeLeft = useCallback((swiperIndex) => {
+    if (mediaModeRef.current === 'photo') {
+      // FIX #5: Correct index accounting for any trim that has occurred
+      const adjustedIndex = swiperIndex + photoTrimOffsetRef.current;
+      // We re-read photos via functional updater to get fresh array
+      setPhotos(currentPhotos => {
+        const photo = currentPhotos[swiperIndex];
+        if (!photo?.id) return currentPhotos;
+        const fileSize = activeAssetInfoRef.current?.fileSize ?? 0;
+        setTrashQueue(prev => [...prev, photo.id]);
+        setSwipeHistory(prev => [...prev, { dir: 'left', assetId: photo.id, fileSize }]);
+        setTrashSizeBytes(prev => prev + fileSize);
+        return currentPhotos;
+      });
+    } else {
+      setVideos(currentVideos => {
+        const video = currentVideos[swiperIndex];
+        if (!video?.id) return currentVideos;
+        const fileSize = activeAssetInfoRef.current?.fileSize ?? 0;
+        setVideoTrashQueue(prev => [...prev, video.id]);
+        setVideoSwipeHistory(prev => [...prev, { dir: 'left', assetId: video.id, fileSize }]);
+        setVideoTrashSizeBytes(prev => prev + fileSize);
+        return currentVideos;
       });
     }
-  };
+    playTrash();
+  }, [playTrash]);
 
-  const handleSwiping = (x) => {
+  const handleSwipeRight = useCallback((swiperIndex) => {
+    if (mediaModeRef.current === 'photo') {
+      setPhotos(currentPhotos => {
+        const photo = currentPhotos[swiperIndex];
+        setSwipeHistory(prev => [...prev, { dir: 'right', assetId: photo?.id, fileSize: 0 }]);
+        return currentPhotos;
+      });
+    } else {
+      setVideos(currentVideos => {
+        const video = currentVideos[swiperIndex];
+        setVideoSwipeHistory(prev => [...prev, { dir: 'right', assetId: video?.id, fileSize: 0 }]);
+        return currentVideos;
+      });
+    }
+    playKeep();
+  }, [playKeep]);
+
+  // FIX #2: handleSwiped reads pagination state from refs, not stale closure
+  const handleSwiped = useCallback((index) => {
+    if (mediaModeRef.current === 'photo') {
+      setCardIndex(index + 1);
+      resetOverlays();
+      if (hasNextPageRef.current && photosLengthRef.current - (index + 1) <= LOAD_AHEAD_THRESHOLD) {
+        loadMorePhotos(endCursorRef.current);
+      }
+      // FIX #4 & #5: Track trim offset so post-trim index lookups stay correct
+      if ((index + 1) >= TRIM_CHUNK && photosLengthRef.current > MAX_PHOTOS_IN_MEMORY) {
+        photoTrimOffsetRef.current += TRIM_CHUNK;
+        setPhotos(prev => prev.slice(TRIM_CHUNK));
+        setCardIndex(prev => {
+          const next = Math.max(0, prev - TRIM_CHUNK);
+          // Defer jumpToCardIndex so Swiper re-renders first
+          setTimeout(() => swiperRef.current?.jumpToCardIndex?.(next), 0);
+          return next;
+        });
+      }
+    } else {
+      const nextVideoIndex = index + 1;
+      setVideoCardIndex(nextVideoIndex);
+      resetOverlays();
+      // Swap the shared player to the next video's source immediately
+      setVideos(currentVideos => {
+        const nextVideo = currentVideos[nextVideoIndex];
+        if (nextVideo?.uri) {
+          videoPlayer.replaceAsync({ uri: nextVideo.uri }).then(() => {
+            videoPlayer.volume = isMutedRef.current ? 0 : 1;
+            videoPlayer.play();
+          }).catch(() => {});
+        }
+        return currentVideos;
+      });
+      if (videoHasNextPageRef.current && videosLengthRef.current - (index + 1) <= LOAD_AHEAD_THRESHOLD) {
+        loadMoreVideos(videoEndCursorRef.current);
+      }
+      if ((index + 1) >= TRIM_CHUNK && videosLengthRef.current > MAX_PHOTOS_IN_MEMORY) {
+        videoTrimOffsetRef.current += TRIM_CHUNK;
+        setVideos(prev => prev.slice(TRIM_CHUNK));
+        setVideoCardIndex(prev => {
+          const next = Math.max(0, prev - TRIM_CHUNK);
+          setTimeout(() => swiperRef.current?.jumpToCardIndex?.(next), 0);
+          return next;
+        });
+      }
+    }
+  }, [resetOverlays, loadMorePhotos, loadMoreVideos]);
+
+  const handleSwiping = useCallback((x) => {
     const threshold = 40;
     if (x < -threshold) {
       Animated.timing(trashOpacity, { toValue: Math.min(1, (Math.abs(x) - threshold) / 80), duration: 0, useNativeDriver: true }).start();
@@ -219,67 +417,118 @@ export default function App() {
     } else {
       resetOverlays();
     }
-  };
+  }, [trashOpacity, keepOpacity, resetOverlays]);
 
-  const handleUndo = () => {
+  const handleUndo = useCallback(() => {
     if (undoInFlightRef.current) return;
-    const history = swipeHistoryRef.current;
+
+    const isPhoto = mediaModeRef.current === 'photo';
+    const history = isPhoto ? swipeHistoryRef.current : videoSwipeHistoryRef.current;
     if (!history?.length) return;
 
     undoInFlightRef.current = true;
     if (undoUnlockTimeoutRef.current) clearTimeout(undoUnlockTimeoutRef.current);
 
     const last = history[history.length - 1];
-    const nextIndex = Math.max(0, cardIndexRef.current - 1);
-    setCardIndex(nextIndex);
-    swiperRef.current?.jumpToCardIndex?.(nextIndex);
-    setSwipeHistory(prev => prev.slice(0, -1));
+    const currentIdx = isPhoto ? cardIndexRef.current : videoCardIndexRef.current;
+    const nextIndex = Math.max(0, currentIdx - 1);
 
-    if (last.dir === 'left' && last.assetId) {
-      setTimeout(() => {
-        setTrashQueue(q => q.filter(id => id !== last.assetId));
-        setTrashSizeBytes(prev => Math.max(0, prev - (last.fileSize ?? 0)));
-      }, SWIPE_BACK_MS + 50);
+    if (isPhoto) {
+      setCardIndex(nextIndex);
+      setSwipeHistory(prev => prev.slice(0, -1));
+      if (last.dir === 'left' && last.assetId) {
+        setTimeout(() => {
+          setTrashQueue(q => q.filter(id => id !== last.assetId));
+          setTrashSizeBytes(prev => Math.max(0, prev - (last.fileSize ?? 0)));
+        }, SWIPE_BACK_MS + 50);
+      }
+    } else {
+      setVideoCardIndex(nextIndex);
+      setVideoSwipeHistory(prev => prev.slice(0, -1));
+      if (last.dir === 'left' && last.assetId) {
+        setTimeout(() => {
+          setVideoTrashQueue(q => q.filter(id => id !== last.assetId));
+          setVideoTrashSizeBytes(prev => Math.max(0, prev - (last.fileSize ?? 0)));
+        }, SWIPE_BACK_MS + 50);
+      }
     }
 
+    setTimeout(() => {
+      swiperRef.current?.jumpToCardIndex?.(nextIndex);
+    }, 0);
+
     undoUnlockTimeoutRef.current = setTimeout(() => { undoInFlightRef.current = false; }, 150);
-  };
+  }, []);
 
-  const handleRescue = (assetId) => {
-    setTrashQueue(q => q.filter(id => id !== assetId));
-    const entry = swipeHistoryRef.current.find(h => h.assetId === assetId && h.dir === 'left');
-    if (entry?.fileSize) setTrashSizeBytes(prev => Math.max(0, prev - entry.fileSize));
-  };
+  const handleRescue = useCallback((assetId) => {
+    if (mediaModeRef.current === 'photo') {
+      setTrashQueue(q => q.filter(id => id !== assetId));
+      const entry = swipeHistoryRef.current.find(h => h.assetId === assetId && h.dir === 'left');
+      if (entry?.fileSize) setTrashSizeBytes(prev => Math.max(0, prev - entry.fileSize));
+    } else {
+      setVideoTrashQueue(q => q.filter(id => id !== assetId));
+      const entry = videoSwipeHistoryRef.current.find(h => h.assetId === assetId && h.dir === 'left');
+      if (entry?.fileSize) setVideoTrashSizeBytes(prev => Math.max(0, prev - entry.fileSize));
+    }
+  }, []);
 
-  const handleEmptyTrash = () => {
-    Alert.alert('Delete Permanently?', `Permanently remove ${trashQueue.length} photos?`, [
+  const handleEmptyTrash = useCallback(() => {
+    const isPhoto = mediaModeRef.current === 'photo';
+    const queue = isPhoto ? trashQueue : videoTrashQueue;
+    const label = isPhoto ? 'photos' : 'videos';
+    Alert.alert('Delete Permanently?', `Permanently remove ${queue.length} ${label}?`, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Delete', style: 'destructive', onPress: async () => {
           try {
-            await MediaLibrary.deleteAssetsAsync(trashQueue);
-            setTrashQueue([]); setTrashSizeBytes(0); setSwipeHistory([]);
+            await MediaLibrary.deleteAssetsAsync(queue);
+            if (isPhoto) {
+              setTrashQueue([]); setTrashSizeBytes(0); setSwipeHistory([]);
+            } else {
+              setVideoTrashQueue([]); setVideoTrashSizeBytes(0); setVideoSwipeHistory([]);
+            }
           } catch {
             Alert.alert('Error', "Couldn't delete. Check permissions.");
           }
         }
       },
     ]);
-  };
+  }, [trashQueue, videoTrashQueue]);
 
   if (hasPermission === null) return <View style={styles.root}><Text style={styles.loadingText}>Requesting permissions…</Text></View>;
   if (hasPermission === false) return <View style={styles.root}><Text style={styles.loadingText}>No access to camera roll.</Text></View>;
-  if (photos.length === 0) return <View style={styles.root}><Text style={styles.loadingText}>Loading photos…</Text></View>;
+  if (photos.length === 0 && videos.length === 0) return <View style={styles.root}><Text style={styles.loadingText}>Loading media…</Text></View>;
 
-  const activePhoto = photos[cardIndex];
-  const allSwiped   = cardIndex >= photos.length && !hasNextPage;
+  const activeAssets   = mediaMode === 'photo' ? photos : videos;
+  const activeIndex    = mediaMode === 'photo' ? cardIndex : videoCardIndex;
+  const activeHasNext  = mediaMode === 'photo' ? hasNextPage : videoHasNextPage;
+  const activeTrashQ   = mediaMode === 'photo' ? trashQueue : videoTrashQueue;
+  const activeSavedBytes = mediaMode === 'photo' ? trashSizeBytes : videoTrashSizeBytes;
+  const activeHistory  = mediaMode === 'photo' ? swipeHistory : videoSwipeHistory;
+
+  const activePhoto = activeAssets[activeIndex];
+  const allSwiped   = activeIndex >= activeAssets.length && !activeHasNext;
 
   return (
     <View style={styles.root}>
       <StatusBar barStyle="light-content" />
 
-      {/* Storage Pill */}
+      {/* Top Bar: Media Toggle + Storage Pill + Mute toggle (video mode only) */}
       <View style={styles.topBar} pointerEvents="box-none">
-        <StoragePill savedBytes={trashSizeBytes} />
+        <MediaToggle mode={mediaMode} onChange={handleModeChange} />
+        <View style={styles.topBarRow}>
+          <StoragePill savedBytes={activeSavedBytes} />
+          {mediaMode === 'video' && (
+            <TouchableOpacity onPress={toggleMute} activeOpacity={0.7}>
+              <BlurView intensity={50} tint="dark" style={styles.muteButton}>
+                <Ionicons
+                  name={isMuted ? 'volume-mute' : 'volume-high'}
+                  size={16}
+                  color="rgba(255,255,255,0.85)"
+                />
+              </BlurView>
+            </TouchableOpacity>
+          )}
+        </View>
       </View>
 
       {/* Edge vignettes — full-height, behind the deck */}
@@ -296,12 +545,21 @@ export default function App() {
         ) : (
           <Swiper
             ref={swiperRef}
-            cards={photos}
-            cardIndex={cardIndex}
+            cards={activeAssets}
+            cardIndex={activeIndex}
             infinite={false}
-            renderCard={(card) => card ? (
+            renderCard={(card, cardIdx) => card ? (
               <View style={styles.card}>
-                <Image source={{ uri: card.uri }} style={styles.cardImage} contentFit="contain" transition={120} />
+                {card.mediaType === 'video' ? (
+                  <VideoView
+                    player={videoPlayer}
+                    style={styles.cardImage}
+                    contentFit="contain"
+                    nativeControls={false}
+                  />
+                ) : (
+                  <Image source={{ uri: card.uri }} style={styles.cardImage} contentFit="contain" transition={120} />
+                )}
               </View>
             ) : null}
             onSwiped={handleSwiped}
@@ -336,16 +594,16 @@ export default function App() {
         onUndo={handleUndo}
         onReview={() => setReviewVisible(true)}
         onTrash={handleEmptyTrash}
-        undoDisabled={swipeHistory.length === 0}
-        trashCount={trashQueue.length}
+        undoDisabled={activeHistory.length === 0}
+        trashCount={activeTrashQ.length}
       />
 
       {/* Modal */}
       <TrashReviewModal
         visible={reviewVisible}
-        trashQueue={trashQueue}
-        photos={photos}
-        swipeHistory={swipeHistory}
+        trashQueue={activeTrashQ}
+        photos={activeAssets}
+        swipeHistory={activeHistory}
         onClose={() => setReviewVisible(false)}
         onRescue={handleRescue}
       />
@@ -357,12 +615,30 @@ const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#000000', alignItems: 'center' },
   loadingText: { color: 'rgba(255,255,255,0.45)', fontSize: 15, position: 'absolute', top: '50%' },
 
-  // Task 3: top changed to 85 to clear Dynamic Island
-  topBar: { position: 'absolute', top: 85, alignSelf: 'center', zIndex: Z.topBar, elevation: Z.topBar },
+  topBar: { position: 'absolute', top: 85, alignSelf: 'center', zIndex: Z.topBar, elevation: Z.topBar, alignItems: 'center', gap: 10 },
   storagePill: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20, ...GLASS_BORDER, overflow: 'hidden' },
   storageText: { color: 'rgba(255,255,255,0.75)', fontSize: 13, fontWeight: '500', letterSpacing: 0.2 },
 
-  // Task 4: edge vignettes
+  // Media toggle
+  togglePill: { borderRadius: 20, overflow: 'hidden', ...GLASS_BORDER },
+  toggleTrack: { flexDirection: 'row', alignItems: 'center', padding: 3, position: 'relative' },
+  toggleThumb: {
+    position: 'absolute', top: 3, left: 3,
+    width: 72, height: 28, borderRadius: 14,
+    backgroundColor: 'rgba(255,255,255,0.18)',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(255,255,255,0.22)',
+  },
+  toggleThumbRight: { left: 75 },
+  toggleLabel: {
+    width: 72, height: 28, lineHeight: 28,
+    textAlign: 'center', fontSize: 13, fontWeight: '500',
+    color: 'rgba(255,255,255,0.4)', letterSpacing: 0.2,
+    zIndex: 1,
+  },
+  toggleLabelActive: { color: 'rgba(255,255,255,0.9)' },
+
+  // Edge vignettes
   vignetteBase: {
     position: 'absolute',
     top: 0,
@@ -381,4 +657,7 @@ const styles = StyleSheet.create({
 
   doneCard: { width: SCREEN_WIDTH - 32, height: CARD_HEIGHT, borderRadius: 22, overflow: 'hidden', alignItems: 'center', justifyContent: 'center', gap: 12, ...GLASS_BORDER },
   doneText: { color: 'rgba(255,255,255,0.4)', fontSize: 18, fontWeight: '500' },
+
+  topBarRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  muteButton: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', overflow: 'hidden', ...GLASS_BORDER },
 });
