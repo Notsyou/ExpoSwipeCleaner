@@ -128,12 +128,15 @@ export default function App() {
   const photosLengthRef = useRef(0);
   const videosLengthRef = useRef(0);
 
+  // Mirror entire videos array into a ref so swipe handlers never close over stale state
+  const videosRef = useRef([]);
+
   useEffect(() => { hasNextPageRef.current = hasNextPage; }, [hasNextPage]);
   useEffect(() => { videoHasNextPageRef.current = videoHasNextPage; }, [videoHasNextPage]);
   useEffect(() => { endCursorRef.current = endCursor; }, [endCursor]);
   useEffect(() => { videoEndCursorRef.current = videoEndCursor; }, [videoEndCursor]);
   useEffect(() => { photosLengthRef.current = photos.length; }, [photos]);
-  useEffect(() => { videosLengthRef.current = videos.length; }, [videos]);
+  useEffect(() => { videosLengthRef.current = videos.length; videosRef.current = videos; }, [videos]);
 
   const trashOpacity = useRef(new Animated.Value(0)).current;
   const keepOpacity  = useRef(new Animated.Value(0)).current;
@@ -142,25 +145,23 @@ export default function App() {
   const keepSoundRef  = useRef(null);
   const trashSoundRef = useRef(null);
 
-  // ── Shared video player ────────────────────────────────────────────────────
-  // One player instance for the whole video tab. Source is swapped on each swipe.
-  // This avoids the isActive prop sync problem entirely.
-  const videoPlayer = useVideoPlayer(null, (p) => {
-    p.loop = true;
-    p.volume = 0; // start muted until user unmutes
-  });
+  // ── Single video player ───────────────────────────────────────────────────
+  // One player, swapped via replaceAsync on each swipe. Local camera roll files
+  // load fast enough that no preloading is needed, and a single decoder gives
+  // the GPU full headroom for smooth 120 Hz playback.
+  const activePlayer = useVideoPlayer(null, (p) => { p.loop = true; p.volume = 0; });
 
-  // Mute state for video playback
+  // Mute state — activePlayer volume only
   const [isMuted, setIsMuted] = useState(true);
   const isMutedRef = useRef(true);
   const toggleMute = useCallback(() => {
     setIsMuted(prev => {
       const next = !prev;
       isMutedRef.current = next;
-      videoPlayer.volume = next ? 0 : 1;
+      activePlayer.volume = next ? 0 : 1;
       return next;
     });
-  }, [videoPlayer]);
+  }, [activePlayer]);
 
   // Sync refs
   useEffect(() => { swipeHistoryRef.current = swipeHistory; }, [swipeHistory]);
@@ -168,18 +169,17 @@ export default function App() {
   useEffect(() => { videoSwipeHistoryRef.current = videoSwipeHistory; }, [videoSwipeHistory]);
   useEffect(() => { videoCardIndexRef.current = videoCardIndex; }, [videoCardIndex]);
 
-  // Seed the shared player with the current frontmost video whenever:
-  // - the video list first loads, or
-  // - the user switches to the video tab
+  // Seed the player when videos first load or when switching to the video tab
   useEffect(() => {
-    if (mediaMode !== 'video') return;
-    const frontVideo = videos[videoCardIndex];
-    if (!frontVideo?.uri) return;
-    videoPlayer.replaceAsync({ uri: frontVideo.uri }).then(() => {
-      videoPlayer.volume = isMutedRef.current ? 0 : 1;
-      videoPlayer.play();
-    }).catch(() => {});
-  }, [mediaMode, videos.length > 0]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (mediaMode !== 'video' || videosRef.current.length === 0) return;
+    const currentUri = videosRef.current[videoCardIndexRef.current]?.uri;
+    if (currentUri) {
+      activePlayer.replaceAsync({ uri: currentUri }).then(() => {
+        activePlayer.volume = isMutedRef.current ? 0 : 1;
+        activePlayer.play();
+      }).catch(() => {});
+    }
+  }, [mediaMode, videos.length > 0, activePlayer]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Load sounds ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -380,17 +380,16 @@ export default function App() {
       const nextVideoIndex = index + 1;
       setVideoCardIndex(nextVideoIndex);
       resetOverlays();
-      // Swap the shared player to the next video's source immediately
-      setVideos(currentVideos => {
-        const nextVideo = currentVideos[nextVideoIndex];
-        if (nextVideo?.uri) {
-          videoPlayer.replaceAsync({ uri: nextVideo.uri }).then(() => {
-            videoPlayer.volume = isMutedRef.current ? 0 : 1;
-            videoPlayer.play();
-          }).catch(() => {});
-        }
-        return currentVideos;
-      });
+
+      // Swap the player to the next video on swipe
+      const nextUri = videosRef.current[nextVideoIndex]?.uri;
+      if (nextUri) {
+        activePlayer.replaceAsync({ uri: nextUri }).then(() => {
+          activePlayer.volume = isMutedRef.current ? 0 : 1;
+          activePlayer.play();
+        }).catch(() => {});
+      }
+
       if (videoHasNextPageRef.current && videosLengthRef.current - (index + 1) <= LOAD_AHEAD_THRESHOLD) {
         loadMoreVideos(videoEndCursorRef.current);
       }
@@ -404,7 +403,7 @@ export default function App() {
         });
       }
     }
-  }, [resetOverlays, loadMorePhotos, loadMoreVideos]);
+  }, [resetOverlays, loadMorePhotos, loadMoreVideos, activePlayer]);
 
   const handleSwiping = useCallback((x) => {
     const threshold = 40;
@@ -451,6 +450,15 @@ export default function App() {
           setVideoTrashSizeBytes(prev => Math.max(0, prev - (last.fileSize ?? 0)));
         }, SWIPE_BACK_MS + 50);
       }
+
+      // Restore the player to the previous video on undo
+      const prevUri = videosRef.current[nextIndex]?.uri;
+      if (prevUri) {
+        activePlayer.replaceAsync({ uri: prevUri }).then(() => {
+          activePlayer.volume = isMutedRef.current ? 0 : 1;
+          activePlayer.play();
+        }).catch(() => {});
+      }
     }
 
     setTimeout(() => {
@@ -458,7 +466,7 @@ export default function App() {
     }, 0);
 
     undoUnlockTimeoutRef.current = setTimeout(() => { undoInFlightRef.current = false; }, 150);
-  }, []);
+  }, [activePlayer]);
 
   const handleRescue = useCallback((assetId) => {
     if (mediaModeRef.current === 'photo') {
@@ -537,6 +545,12 @@ export default function App() {
 
       {/* Deck Area */}
       <View style={styles.deckArea} pointerEvents="box-none">
+        {/* Persistent video underlay — rendered BEFORE (under) the Swiper so the
+            Swiper's gesture responder sits on top and receives all touch events.
+            VideoView never unmounts between swipes, eliminating the black-frame
+            flash that happens when it's inside renderCard and gets remounted. */}
+
+
         {allSwiped ? (
           <BlurView intensity={50} tint="dark" style={styles.doneCard}>
             <Ionicons name="checkmark-circle" size={52} color="rgba(255,255,255,0.45)" />
@@ -544,24 +558,36 @@ export default function App() {
           </BlurView>
         ) : (
           <Swiper
+            key={mediaMode}
             ref={swiperRef}
             cards={activeAssets}
             cardIndex={activeIndex}
             infinite={false}
-            renderCard={(card, cardIdx) => card ? (
-              <View style={styles.card}>
-                {card.mediaType === 'video' ? (
-                  <VideoView
-                    player={videoPlayer}
-                    style={styles.cardImage}
-                    contentFit="contain"
-                    nativeControls={false}
-                  />
-                ) : (
+            renderCard={(card, cardIdx) => {
+              if (!card) return null;
+              if (card.mediaType === 'video') {
+                // Only attach the player to the front card — back cards are plain
+                // dark placeholders so they don't decode any video frames.
+                const isFront = cardIdx === videoCardIndex;
+                return (
+                  <View style={styles.card}>
+                    {isFront ? (
+                      <VideoView
+                        player={activePlayer}
+                        style={styles.cardImage}
+                        contentFit="contain"
+                        nativeControls={false}
+                      />
+                    ) : null}
+                  </View>
+                );
+              }
+              return (
+                <View style={styles.card}>
                   <Image source={{ uri: card.uri }} style={styles.cardImage} contentFit="contain" transition={120} />
-                )}
-              </View>
-            ) : null}
+                </View>
+              );
+            }}
             onSwiped={handleSwiped}
             onSwipedLeft={handleSwipeLeft}
             onSwipedRight={handleSwipeRight}
@@ -660,4 +686,15 @@ const styles = StyleSheet.create({
 
   topBarRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   muteButton: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', overflow: 'hidden', ...GLASS_BORDER },
+
+  // Persistent video underlay: rendered before the Swiper so gestures pass through to it.
+  videoOverlay: {
+    position: 'absolute',
+    width: SCREEN_WIDTH - 32,
+    height: CARD_HEIGHT,
+    borderRadius: 22,
+    overflow: 'hidden',
+    alignSelf: 'center',
+    // No zIndex — sits underneath the Swiper which is rendered after it
+  },
 });
