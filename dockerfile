@@ -14,3 +14,4 @@ EXPOSE 19000
 EXPOSE 19001
 
 CMD ["npx", "expo", "start", "--host", "lan"]
+#temp
