@@ -1,31 +1,57 @@
 /**
  * components/ActionButtons.js
  */
-import React from 'react';
-import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
+import React, { useRef } from 'react';
+import { View, Text, TouchableOpacity, StyleSheet, Animated } from 'react-native';
 import { BlurView } from 'expo-blur';
 import { Ionicons } from '@expo/vector-icons';
 import { SAFE_BOTTOM, GLASS_BORDER, Z } from '../constants';
 
-const ActionButton = ({ icon, label, onPress, badge, danger, disabled }) => (
-  <TouchableOpacity
-    style={[styles.btn, disabled && styles.btnDisabled]}
-    onPress={onPress}
-    activeOpacity={0.6}
-    disabled={disabled}
-    hitSlop={{ top: 10, bottom: 10, left: 8, right: 8 }}
-  >
-    <View style={styles.iconWrap}>
-      <Ionicons name={icon} size={23} color={danger ? '#FF453A' : '#FFFFFF'} />
-      {badge != null && (
-        <View style={styles.badge}>
-          <Text style={styles.badgeText}>{badge > 99 ? '99+' : badge}</Text>
-        </View>
-      )}
-    </View>
-    <Text style={[styles.label, danger && { color: '#FF453A' }]}>{label}</Text>
-  </TouchableOpacity>
-);
+const ActionButton = ({ icon, label, onPress, badge, danger, disabled }) => {
+  const scale = useRef(new Animated.Value(1)).current;
+
+  const handlePressIn = () => {
+    Animated.spring(scale, {
+      toValue: 0.82,
+      useNativeDriver: true,
+      tension: 120,
+      friction: 8,
+    }).start();
+  };
+
+  const handlePressOut = () => {
+    Animated.spring(scale, {
+      toValue: 1,
+      useNativeDriver: true,
+      tension: 80,
+      friction: 7,
+    }).start();
+  };
+
+  return (
+    <TouchableOpacity
+      style={[styles.btn, disabled && styles.btnDisabled]}
+      onPress={onPress}
+      onPressIn={handlePressIn}
+      onPressOut={handlePressOut}
+      activeOpacity={1}
+      disabled={disabled}
+      hitSlop={{ top: 10, bottom: 10, left: 8, right: 8 }}
+    >
+      <Animated.View style={[styles.iconWrap, { transform: [{ scale }] }]}>
+        <BlurView intensity={40} tint="dark" style={[styles.iconBg, danger && styles.iconBgDanger]}>
+          <Ionicons name={icon} size={22} color={danger ? '#FF6B6B' : 'rgba(255,255,255,0.9)'} />
+        </BlurView>
+        {badge != null && (
+          <View style={styles.badge}>
+            <Text style={styles.badgeText}>{badge > 99 ? '99+' : badge}</Text>
+          </View>
+        )}
+      </Animated.View>
+      <Text style={[styles.label, danger && styles.labelDanger]}>{label}</Text>
+    </TouchableOpacity>
+  );
+};
 
 export default function ActionButtons({ onUndo, onReview, onTrash, undoDisabled, trashCount }) {
   return (
@@ -66,21 +92,39 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-start',
     justifyContent: 'space-around',
-    paddingTop: 12,
-    paddingBottom: SAFE_BOTTOM + 8,
+    paddingTop: 14,
+    paddingBottom: SAFE_BOTTOM + 10,
     paddingHorizontal: 20,
     ...GLASS_BORDER,
-    borderBottomWidth: 0, 
+    borderBottomWidth: 0,
   },
-  btn: { alignItems: 'center', gap: 4, minWidth: 60 },
-  btnDisabled: { opacity: 0.28 },
+  btn: { alignItems: 'center', gap: 6, minWidth: 64 },
+  btnDisabled: { opacity: 0.25 },
   iconWrap: { position: 'relative' },
-  label: { color: 'rgba(255,255,255,0.5)', fontSize: 10, fontWeight: '500', letterSpacing: 0.3 },
-  badge: {
-    position: 'absolute', top: -5, right: -10,
-    backgroundColor: '#FF453A', borderRadius: 9,
-    minWidth: 17, height: 17,
-    alignItems: 'center', justifyContent: 'center', paddingHorizontal: 3,
+  iconBg: {
+    width: 52, height: 52, borderRadius: 16,
+    alignItems: 'center', justifyContent: 'center',
+    overflow: 'hidden',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(255,255,255,0.13)',
   },
-  badgeText: { color: 'white', fontSize: 9, fontWeight: '700' },
+  iconBgDanger: {
+    borderColor: 'rgba(255,107,107,0.25)',
+  },
+  label: {
+    color: 'rgba(255,255,255,0.45)',
+    fontSize: 11,
+    fontWeight: '500',
+    letterSpacing: 0.3,
+  },
+  labelDanger: { color: 'rgba(255,107,107,0.8)' },
+  badge: {
+    position: 'absolute', top: -5, right: -8,
+    backgroundColor: '#FF453A', borderRadius: 9,
+    minWidth: 18, height: 18,
+    alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4,
+    borderWidth: 1.5,
+    borderColor: 'rgba(0,0,0,0.4)',
+  },
+  badgeText: { color: 'white', fontSize: 10, fontWeight: '700' },
 });
