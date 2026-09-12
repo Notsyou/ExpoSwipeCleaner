@@ -337,6 +337,10 @@ export default function App() {
   const activePlayerRef = useRef(null);
   useEffect(() => { activePlayerRef.current = activePlayer; }, [activePlayer]);
 
+  // Guards against out-of-order replaceAsync resolution when swiping quickly —
+  // only the most recently issued replace is allowed to call .play() when it resolves.
+  const replaceRequestIdRef = useRef(0);
+
   // Mute state — activePlayer volume only
   const [isMuted, setIsMuted] = useState(true);
   const isMutedRef = useRef(true);
@@ -387,7 +391,9 @@ export default function App() {
     if (mediaMode !== 'video' || videosRef.current.length === 0) return;
     const currentUri = videosRef.current[videoCardIndexRef.current]?.uri;
     if (currentUri) {
+      const requestId = ++replaceRequestIdRef.current;
       activePlayer.replaceAsync({ uri: currentUri }).then(() => {
+        if (replaceRequestIdRef.current !== requestId) return;
         activePlayer.volume = isMutedRef.current ? 0 : 1;
         activePlayer.play();
       }).catch(() => {});
@@ -431,12 +437,12 @@ export default function App() {
         // Pre-warm: play silently so the audio engine is primed for instant first swipe
         keepSound.volume = 0;
         keepSound.play();
-        keepSound.seekTo(0);
+        await keepSound.seekTo(0);
         keepSound.volume = 0.7;
 
         trashSound.volume = 0;
         trashSound.play();
-        trashSound.seekTo(0);
+        await trashSound.seekTo(0);
         trashSound.volume = 0.8;
       } catch (e) {
         console.warn('Sound init failed:', e);
@@ -448,20 +454,27 @@ export default function App() {
     };
   }, []);
 
-  // Fire-and-forget: seekTo + play is effectively instant — no gap between
-  // seek and play, and rapid swipes interrupt cleanly without stuttering.
-  const playKeep = useCallback(() => {
+  // Await seekTo before play — seekTo is async under the hood, and calling
+  // play() before it resolves on rapid swipes causes drift/desync between
+  // swipe timing and the sound actually firing.
+  const playKeep = useCallback(async () => {
     try {
-      keepSoundRef.current?.seekTo(0);
-      keepSoundRef.current?.play();
+      const player = keepSoundRef.current;
+      if (player) {
+        await player.seekTo(0);
+        player.play();
+      }
     } catch {}
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }, []);
 
-  const playTrash = useCallback(() => {
+  const playTrash = useCallback(async () => {
     try {
-      trashSoundRef.current?.seekTo(0);
-      trashSoundRef.current?.play();
+      const player = trashSoundRef.current;
+      if (player) {
+        await player.seekTo(0);
+        player.play();
+      }
     } catch {}
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
   }, []);
@@ -615,10 +628,12 @@ export default function App() {
       resetOverlays();
       resetVideoUI();
 
-      // Swap the player to the next video on swipe
+      // Swap the player to the next video on swipe — guarded against out-of-order resolution
       const nextUri = videosRef.current[nextVideoIndex]?.uri;
       if (nextUri) {
+        const requestId = ++replaceRequestIdRef.current;
         activePlayer.replaceAsync({ uri: nextUri }).then(() => {
+          if (replaceRequestIdRef.current !== requestId) return;
           activePlayer.volume = isMutedRef.current ? 0 : 1;
           activePlayer.play();
         }).catch(() => {});
@@ -685,10 +700,12 @@ export default function App() {
         }, SWIPE_BACK_MS + 50);
       }
 
-      // Restore the player to the previous video on undo
+      // Restore the player to the previous video on undo — guarded against out-of-order resolution
       const prevUri = videosRef.current[nextIndex]?.uri;
       if (prevUri) {
+        const requestId = ++replaceRequestIdRef.current;
         activePlayer.replaceAsync({ uri: prevUri }).then(() => {
+          if (replaceRequestIdRef.current !== requestId) return;
           activePlayer.volume = isMutedRef.current ? 0 : 1;
           activePlayer.play();
         }).catch(() => {});
