@@ -1,23 +1,29 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { StyleSheet, Text, View, Alert, StatusBar, Animated, TouchableOpacity, PanResponder, ScrollView } from 'react-native';
-import { GestureHandlerRootView, PinchGestureHandler, State } from 'react-native-gesture-handler';
-import { Image } from 'expo-image';
+import { Ionicons } from '@expo/vector-icons';
+import { createAudioPlayer, setAudioModeAsync } from 'expo-audio';
 import { BlurView } from 'expo-blur';
+import * as Haptics from 'expo-haptics';
+import { Image } from 'expo-image';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as MediaLibrary from 'expo-media-library';
-import Swiper from 'react-native-deck-swiper';
-import { Ionicons } from '@expo/vector-icons';
-import { Audio } from 'expo-av';
 import { useVideoPlayer, VideoView } from 'expo-video';
-import * as Haptics from 'expo-haptics';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Alert, Animated, PanResponder, StatusBar, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import Swiper from 'react-native-deck-swiper';
+import { GestureHandlerRootView, PinchGestureHandler, State } from 'react-native-gesture-handler';
 
 // Components & Constants
-import TrashReviewModal from './components/TrashReviewModal';
-import MetadataPanel from './components/MetadataPanel';
 import ActionButtons from './components/ActionButtons';
+import MetadataPanel from './components/MetadataPanel';
+import TrashReviewModal from './components/TrashReviewModal';
 import {
-  SCREEN_WIDTH, SCREEN_HEIGHT, CARD_HEIGHT, Z, PAGE_SIZE, PREFETCH_BATCH,
-  LOAD_AHEAD_THRESHOLD, MAX_PHOTOS_IN_MEMORY, TRIM_CHUNK, SWIPE_BACK_MS, GLASS_BORDER
+  CARD_HEIGHT,
+  GLASS_BORDER,
+  LOAD_AHEAD_THRESHOLD, MAX_PHOTOS_IN_MEMORY,
+  PAGE_SIZE, PREFETCH_BATCH,
+  SCREEN_WIDTH,
+  SWIPE_BACK_MS,
+  TRIM_CHUNK,
+  Z
 } from './constants';
 
 
@@ -415,38 +421,48 @@ export default function App() {
     let keepSound, trashSound;
     (async () => {
       try {
-        await Audio.setAudioModeAsync({ playsInSilentModeIOS: true });
-        ({ sound: keepSound  } = await Audio.Sound.createAsync(require('./assets/SwitchClick.mp3'), { volume: 0.7 }));
-        ({ sound: trashSound } = await Audio.Sound.createAsync(require('./assets/PaperSlide.mp3'),  { volume: 0.8 }));
+        await setAudioModeAsync({ playsInSilentMode: true });
+
+        keepSound  = createAudioPlayer(require('./assets/SwitchClick.mp3'));
+        trashSound = createAudioPlayer(require('./assets/PaperSlide.mp3'));
         keepSoundRef.current  = keepSound;
         trashSoundRef.current = trashSound;
 
         // Pre-warm: play silently so the audio engine is primed for instant first swipe
-        await keepSound.setVolumeAsync(0);
-        await keepSound.replayAsync();
-        await keepSound.setVolumeAsync(0.7);
-        await trashSound.setVolumeAsync(0);
-        await trashSound.replayAsync();
-        await trashSound.setVolumeAsync(0.8);
+        keepSound.volume = 0;
+        keepSound.play();
+        keepSound.seekTo(0);
+        keepSound.volume = 0.7;
+
+        trashSound.volume = 0;
+        trashSound.play();
+        trashSound.seekTo(0);
+        trashSound.volume = 0.8;
       } catch (e) {
         console.warn('Sound init failed:', e);
       }
     })();
     return () => {
-      keepSound?.unloadAsync();
-      trashSound?.unloadAsync();
+      keepSound?.remove();
+      trashSound?.remove();
     };
   }, []);
 
-  // Fire-and-forget: replayAsync is a single atomic seek+play call — no await needed,
-  // no gap between seek and play, and rapid swipes interrupt cleanly without stuttering.
+  // Fire-and-forget: seekTo + play is effectively instant — no gap between
+  // seek and play, and rapid swipes interrupt cleanly without stuttering.
   const playKeep = useCallback(() => {
-    keepSoundRef.current?.replayAsync().catch(() => {});
+    try {
+      keepSoundRef.current?.seekTo(0);
+      keepSoundRef.current?.play();
+    } catch {}
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
   }, []);
 
   const playTrash = useCallback(() => {
-    trashSoundRef.current?.replayAsync().catch(() => {});
+    try {
+      trashSoundRef.current?.seekTo(0);
+      trashSoundRef.current?.play();
+    } catch {}
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
   }, []);
 
@@ -462,7 +478,7 @@ export default function App() {
     })();
   }, []);
 
-  // FIX #3: loadMorePhotos uses ref for hasNextPage guard, not stale closure state
+  // FIX #3: loadMorePhotos uses ref for hasNextPage guard, not stale closure
   const loadMorePhotos = useCallback(async (cursor = null) => {
     if (!hasNextPageRef.current && cursor !== null) return;
     if (loadingMoreRef.current) return;
@@ -792,12 +808,6 @@ export default function App() {
 
       {/* Deck Area */}
       <View style={styles.deckArea} pointerEvents="box-none">
-        {/* Persistent video underlay — rendered BEFORE (under) the Swiper so the
-            Swiper's gesture responder sits on top and receives all touch events.
-            VideoView never unmounts between swipes, eliminating the black-frame
-            flash that happens when it's inside renderCard and gets remounted. */}
-
-
         {mediaMode === 'photo' && photosLoaded && photos.length === 0 ? (
           <SplashScreen icon="images-outline" message="No photos found" />
         ) : mediaMode === 'video' && videosLoaded && videos.length === 0 ? (
@@ -860,8 +870,6 @@ export default function App() {
           </Animated.View>
         )}
 
-        {/* ── Photo pinch-to-zoom overlay ── sits above Swiper, pointerEvents lets
-            horizontal swipes fall through; only pinch (2-finger) is captured here */}
         {mediaMode === 'photo' && !allSwiped && (
           <PinchGestureHandler
             ref={pinchRef}
@@ -889,17 +897,13 @@ export default function App() {
           </PinchGestureHandler>
         )}
 
-        {/* ── Video controls overlay ── tap-to-pause + scrub bar + duration badge + pause icon
-            Lives outside the Swiper so PanResponder and taps aren't swallowed */}
         {mediaMode === 'video' && !allSwiped && (
           <View style={styles.videoControlsOverlay} pointerEvents="box-none">
-            {/* Tap-to-pause — covers the card but lets swipe gestures through */}
             <TouchableOpacity
               activeOpacity={1}
               onPress={handleVideoTap}
               style={StyleSheet.absoluteFillObject}
             />
-            {/* Pause icon */}
             {isVideoPaused && (
               <View style={styles.pauseOverlay} pointerEvents="none">
                 <BlurView intensity={55} tint="dark" style={styles.pausePill}>
@@ -907,7 +911,6 @@ export default function App() {
                 </BlurView>
               </View>
             )}
-            {/* Duration badge */}
             {formatDuration(activeAssets[videoCardIndex]?.duration) && (
               <BlurView intensity={52} tint="dark" style={styles.durationBadge} pointerEvents="none">
                 <Ionicons name="play" size={10} color="rgba(255,255,255,0.85)" />
@@ -916,7 +919,6 @@ export default function App() {
                 </Text>
               </BlurView>
             )}
-            {/* Scrub bar */}
             <View style={styles.scrubBarContainer} pointerEvents="box-none">
               <ScrubBar
                 progress={videoProgress}
@@ -966,7 +968,6 @@ const styles = StyleSheet.create({
   storagePill: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20, ...GLASS_BORDER, overflow: 'hidden' },
   storageText: { color: 'rgba(255,255,255,0.75)', fontSize: 13, fontWeight: '500', letterSpacing: 0.2 },
 
-  // Media toggle
   togglePill: { borderRadius: 20, overflow: 'hidden', ...GLASS_BORDER },
   toggleTrack: { flexDirection: 'row', alignItems: 'center', padding: 3, position: 'relative' },
   toggleThumb: {
@@ -985,7 +986,6 @@ const styles = StyleSheet.create({
   },
   toggleLabelActive: { color: 'rgba(255,255,255,0.9)' },
 
-  // Edge vignettes
   vignetteBase: {
     position: 'absolute',
     top: 0,
@@ -1008,7 +1008,6 @@ const styles = StyleSheet.create({
   topBarRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   muteButton: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', overflow: 'hidden', ...GLASS_BORDER },
 
-  // Duration badge on video cards
   durationBadge: {
     position: 'absolute', bottom: 56, left: 14,
     flexDirection: 'row', alignItems: 'center', gap: 5,
@@ -1020,7 +1019,6 @@ const styles = StyleSheet.create({
   },
   durationText: { color: 'rgba(255,255,255,0.92)', fontSize: 12, fontWeight: '600', letterSpacing: 0.3 },
 
-  // Pause overlay
   pauseOverlay: {
     ...StyleSheet.absoluteFillObject,
     alignItems: 'center', justifyContent: 'center',
@@ -1034,13 +1032,11 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255,255,255,0.18)',
   },
 
-  // Scrub bar container
   scrubBarContainer: {
     position: 'absolute', bottom: 16, left: 16, right: 16,
     alignItems: 'center',
   },
 
-  // Overlay that sits above the Swiper for pinch-to-zoom (photos)
   cardOverlay: {
     position: 'absolute',
     width: SCREEN_WIDTH - 32,
@@ -1049,7 +1045,6 @@ const styles = StyleSheet.create({
     alignSelf: 'center',
   },
 
-  // Overlay for video controls (tap-to-pause, scrub, duration badge)
   videoControlsOverlay: {
     position: 'absolute',
     width: SCREEN_WIDTH - 32,
@@ -1061,10 +1056,8 @@ const styles = StyleSheet.create({
     elevation: Z.swiper + 1,
   },
 
-  // StoragePill dim text
   storageTextDim: { color: 'rgba(255,255,255,0.4)', fontSize: 13, fontWeight: '400' },
 
-  // Persistent video underlay: rendered before the Swiper so gestures pass through to it.
   videoOverlay: {
     position: 'absolute',
     width: SCREEN_WIDTH - 32,
@@ -1072,6 +1065,5 @@ const styles = StyleSheet.create({
     borderRadius: 22,
     overflow: 'hidden',
     alignSelf: 'center',
-    // No zIndex — sits underneath the Swiper which is rendered after it
   },
 });
