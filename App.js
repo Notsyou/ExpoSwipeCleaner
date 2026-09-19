@@ -394,6 +394,9 @@ export default function App() {
       const requestId = ++replaceRequestIdRef.current;
       activePlayer.replaceAsync({ uri: currentUri }).then(() => {
         if (replaceRequestIdRef.current !== requestId) return;
+        // replaceAsync resets player config to defaults — loop must be re-applied
+        // on every swap, or each clip plays once and stops at its natural end.
+        activePlayer.loop = true;
         activePlayer.volume = isMutedRef.current ? 0 : 1;
         activePlayer.play();
       }).catch(() => {});
@@ -634,6 +637,9 @@ export default function App() {
         const requestId = ++replaceRequestIdRef.current;
         activePlayer.replaceAsync({ uri: nextUri }).then(() => {
           if (replaceRequestIdRef.current !== requestId) return;
+          // replaceAsync resets player config to defaults — loop must be
+          // re-applied on every swap, or the clip plays once and stops.
+          activePlayer.loop = true;
           activePlayer.volume = isMutedRef.current ? 0 : 1;
           activePlayer.play();
         }).catch(() => {});
@@ -706,6 +712,9 @@ export default function App() {
         const requestId = ++replaceRequestIdRef.current;
         activePlayer.replaceAsync({ uri: prevUri }).then(() => {
           if (replaceRequestIdRef.current !== requestId) return;
+          // replaceAsync resets player config to defaults — loop must be
+          // re-applied on every swap, or the clip plays once and stops.
+          activePlayer.loop = true;
           activePlayer.volume = isMutedRef.current ? 0 : 1;
           activePlayer.play();
         }).catch(() => {});
