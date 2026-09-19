@@ -267,6 +267,8 @@ export default function App() {
   const [videoProgress, setVideoProgress] = useState(0);   // 0–1
   const [videoDuration, setVideoDuration] = useState(0);   // seconds
   const scrubbing = useRef(false);
+  const isVideoPausedRef = useRef(false);
+  useEffect(() => { isVideoPausedRef.current = isVideoPaused; }, [isVideoPaused]);
 
   // ── Total storage ──────────────────────────────────────────────────────────
   const [totalStorageBytes, setTotalStorageBytes] = useState(0);
@@ -422,6 +424,7 @@ export default function App() {
   // Reset scrub state on swipe
   const resetVideoUI = useCallback(() => {
     setVideoProgress(0);
+    isVideoPausedRef.current = false;
     setIsVideoPaused(false);
   }, []);
 
@@ -730,13 +733,11 @@ export default function App() {
 
   const handleVideoTap = useCallback(() => {
     if (mediaModeRef.current !== 'video') return;
-    setIsVideoPaused(prev => {
-      const next = !prev;
-      const p = activePlayerRef.current;
-      if (next) p?.pause();
-      else p?.play();
-      return next;
-    });
+    const p = activePlayerRef.current;
+    const next = !isVideoPausedRef.current;
+    isVideoPausedRef.current = next;
+    setIsVideoPaused(next);
+    if (next) p?.pause(); else p?.play();
   }, []);
 
   const handleScrubStart = useCallback(() => { scrubbing.current = true; }, []);
@@ -861,6 +862,9 @@ export default function App() {
                           style={[styles.cardImage, { alignSelf: 'center' }]}
                           contentFit="contain"
                           nativeControls={false}
+                          onFirstFrameRender={() => {
+                            if (!isVideoPausedRef.current) activePlayer.play();
+                          }}
                         />
                       ) : null}
                     </View>
