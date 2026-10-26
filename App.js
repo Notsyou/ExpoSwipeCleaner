@@ -335,7 +335,7 @@ export default function App() {
   // One player, swapped via replaceAsync on each swipe. Local camera roll files
   // load fast enough that no preloading is needed, and a single decoder gives
   // the GPU full headroom for smooth 120 Hz playback.
-  const activePlayer = useVideoPlayer(null, (p) => { p.loop = true; p.volume = 0; });
+  const activePlayer = useVideoPlayer(null, (p) => { p.loop = true; p.volume = 0; p.audioMixingMode = 'mixWithOthers'; });
   const activePlayerRef = useRef(null);
   useEffect(() => { activePlayerRef.current = activePlayer; }, [activePlayer]);
 
@@ -399,11 +399,22 @@ export default function App() {
         // replaceAsync resets player config to defaults — loop must be re-applied
         // on every swap, or each clip plays once and stops at its natural end.
         activePlayer.loop = true;
+        activePlayer.audioMixingMode = 'mixWithOthers';
         activePlayer.volume = isMutedRef.current ? 0 : 1;
         activePlayer.play();
       }).catch(() => {});
     }
   }, [mediaMode, videos.length > 0, activePlayer]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Resume if the OS or another player pauses the video without the user tapping
+  useEffect(() => {
+    const sub = activePlayer.addListener('playingChange', ({ isPlaying }) => {
+      if (isPlaying || mediaModeRef.current !== 'video') return;
+      if (isVideoPausedRef.current || scrubbing.current) return;
+      activePlayer.play();
+    });
+    return () => sub.remove();
+  }, [activePlayer]);
 
   // Poll video progress for scrub bar — reads from ref to avoid stale closure
   useEffect(() => {
@@ -433,7 +444,8 @@ export default function App() {
     let keepSound, trashSound;
     (async () => {
       try {
-        await setAudioModeAsync({ playsInSilentMode: true });
+        // Mix with the video player — taking audio focus here pauses the video mid-clip.
+        await setAudioModeAsync({ playsInSilentMode: true, interruptionMode: 'mixWithOthers' });
 
         keepSound  = createAudioPlayer(require('./assets/SwitchClick.mp3'));
         trashSound = createAudioPlayer(require('./assets/PaperSlide.mp3'));
@@ -553,6 +565,9 @@ export default function App() {
   const handleModeChange = useCallback((m) => {
     mediaModeRef.current = m;
     setMediaMode(m);
+    // Leaving videos pauses playback; entering always starts unpaused
+    if (m === 'photo') activePlayerRef.current?.pause();
+    else { isVideoPausedRef.current = false; setIsVideoPaused(false); }
     Animated.parallel([
       Animated.timing(trashOpacity, { toValue: 0, duration: 0, useNativeDriver: true }),
       Animated.timing(keepOpacity,  { toValue: 0, duration: 0, useNativeDriver: true }),
@@ -643,6 +658,7 @@ export default function App() {
           // replaceAsync resets player config to defaults — loop must be
           // re-applied on every swap, or the clip plays once and stops.
           activePlayer.loop = true;
+          activePlayer.audioMixingMode = 'mixWithOthers';
           activePlayer.volume = isMutedRef.current ? 0 : 1;
           activePlayer.play();
         }).catch(() => {});
@@ -718,6 +734,7 @@ export default function App() {
           // replaceAsync resets player config to defaults — loop must be
           // re-applied on every swap, or the clip plays once and stops.
           activePlayer.loop = true;
+          activePlayer.audioMixingMode = 'mixWithOthers';
           activePlayer.volume = isMutedRef.current ? 0 : 1;
           activePlayer.play();
         }).catch(() => {});
