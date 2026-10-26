@@ -1,0 +1,19 @@
+diff --git a/node_modules/react-native-deck-swiper/Swiper.js b/node_modules/react-native-deck-swiper/Swiper.js
+--- a/node_modules/react-native-deck-swiper/Swiper.js
++++ b/node_modules/react-native-deck-swiper/Swiper.js
+@@ -1,5 +1,5 @@
+ import React, { Component } from 'react'
+-import { PanResponder, Text, View, Dimensions, Animated, InteractionManager } from 'react-native'
++import { PanResponder, Text, View, Dimensions, Animated } from 'react-native'
+ import PropTypes from 'prop-types'
+ import isEqual from 'lodash/isEqual'
+
+@@ -88,7 +88,7 @@
+
+   componentWillUnmount = () => {
+     this._mounted = false;
+-    InteractionManager.runAfterInteractions(this.componentWillUnmountAfterInteractions.bind(this));
++    this.componentWillUnmountAfterInteractions();
+   }
+
+   getCardStyle = () => {
