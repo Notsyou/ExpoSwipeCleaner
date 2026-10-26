@@ -7,7 +7,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 import * as MediaLibrary from 'expo-media-library/legacy';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Animated, PanResponder, StatusBar, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Alert, Animated, AppState, PanResponder, StatusBar, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import Swiper from 'react-native-deck-swiper';
 import { GestureHandlerRootView, PinchGestureHandler, State } from 'react-native-gesture-handler';
 
@@ -16,6 +16,7 @@ import ActionButtons from './components/ActionButtons';
 import MetadataPanel from './components/MetadataPanel';
 import TrashReviewModal from './components/TrashReviewModal';
 import { clearProgress, loadProgress, PHOTO_DECKS, saveProgress, selectForDeck } from './lib/progress';
+import { listenForReminderTaps, refreshReminder } from './lib/reminder';
 import {
   CARD_HEIGHT,
   GLASS_BORDER,
@@ -253,6 +254,16 @@ export default function App() {
   const [hasPermission, setHasPermission] = useState(null);
   const [mediaMode, setMediaMode] = useState('photo'); // 'photo' | 'video'
   const mediaModeRef = useRef('photo');
+
+  // ── 24h reminder: reschedule on every launch/foreground, log taps ─────────
+  useEffect(() => {
+    const unsubscribe = listenForReminderTaps();
+    refreshReminder();
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next === 'active') refreshReminder();
+    });
+    return () => { unsubscribe(); sub.remove(); };
+  }, []);
 
   // ── Photo state ────────────────────────────────────────────────────────────
   const [photos, setPhotos] = useState([]);
