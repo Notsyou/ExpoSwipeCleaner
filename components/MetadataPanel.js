@@ -15,7 +15,7 @@ import React, { useEffect, useState } from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import { BlurView } from 'expo-blur';
 import { Ionicons } from '@expo/vector-icons';
-import * as MediaLibrary from 'expo-media-library';
+import * as MediaLibrary from 'expo-media-library/legacy';
 // SDK 54+: import from the legacy sub-path to avoid deprecation throws.
 // The API surface is identical to the old expo-file-system.
 import * as FileSystem from 'expo-file-system/legacy';
