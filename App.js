@@ -15,6 +15,7 @@ import { GestureHandlerRootView, PinchGestureHandler, State } from 'react-native
 import ActionButtons from './components/ActionButtons';
 import MetadataPanel from './components/MetadataPanel';
 import TrashReviewModal from './components/TrashReviewModal';
+import { clearProgress, loadProgress, PHOTO_DECKS, saveProgress, selectForDeck } from './lib/progress';
 import {
   CARD_HEIGHT,
   GLASS_BORDER,
@@ -38,7 +39,7 @@ const formatDuration = (secs) => {
 };
 
 // ─── StoragePill ──────────────────────────────────────────────────────────────
-const StoragePill = ({ savedBytes, totalBytes }) => {
+const StoragePill = ({ savedBytes, totalBytes, onLongPress }) => {
   const hasSaved = savedBytes > 0;
   const hasTotal = totalBytes > 0;
   if (!hasSaved && !hasTotal) return null;
@@ -46,12 +47,28 @@ const StoragePill = ({ savedBytes, totalBytes }) => {
     ? (b / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
     : (b / (1024 * 1024)).toFixed(0) + ' MB';
   return (
-    <BlurView intensity={50} tint="dark" style={styles.storagePill}>
-      <Ionicons name="cloud-done-outline" size={13} color="rgba(255,255,255,0.55)" />
-      {hasSaved && <Text style={styles.storageText}>{toGB(savedBytes)} saved</Text>}
-      {hasSaved && hasTotal && <Text style={styles.storageTextDim}>·</Text>}
-      {hasTotal && <Text style={styles.storageTextDim}>{toGB(totalBytes)} total</Text>}
-    </BlurView>
+    <TouchableOpacity onLongPress={onLongPress} activeOpacity={0.8} delayLongPress={600}>
+      <BlurView intensity={50} tint="dark" style={styles.storagePill}>
+        <Ionicons name="cloud-done-outline" size={13} color="rgba(255,255,255,0.55)" />
+        {hasSaved && <Text style={styles.storageText}>{toGB(savedBytes)} saved</Text>}
+        {hasSaved && hasTotal && <Text style={styles.storageTextDim}>·</Text>}
+        {hasTotal && <Text style={styles.storageTextDim}>{toGB(totalBytes)} total</Text>}
+      </BlurView>
+    </TouchableOpacity>
+  );
+};
+
+// ─── DeckPill ─────────────────────────────────────────────────────────────────
+// Tap cycles the photo deck: All → Screenshots → Similar
+const DeckPill = ({ deck, onPress }) => {
+  const current = PHOTO_DECKS.find(d => d.key === deck) ?? PHOTO_DECKS[0];
+  return (
+    <TouchableOpacity onPress={onPress} activeOpacity={0.7}>
+      <BlurView intensity={50} tint="dark" style={styles.storagePill}>
+        <Ionicons name={current.icon} size={13} color="rgba(255,255,255,0.75)" />
+        <Text style={styles.storageText}>{current.label}</Text>
+      </BlurView>
+    </TouchableOpacity>
   );
 };
 
@@ -251,6 +268,20 @@ export default function App() {
   const loadingMoreVideosRef = useRef(false);
 
   const [reviewVisible, setReviewVisible] = useState(false);
+
+  // ── Persisted progress + smart decks ───────────────────────────────────────
+  // reviewedBaseRef: IDs reviewed in earlier sessions (or before a history reset).
+  // This session's swipes live in swipeHistory and are merged in when saving.
+  const reviewedBaseRef = useRef({ photo: new Set(), video: new Set() });
+  // Trashed assets that aren't in the current deck (restored from storage or
+  // left behind by a deck switch) — kept so the review modal can still show them.
+  const trashCacheRef = useRef({ photo: new Map(), video: new Map() });
+  const progressReadyRef = useRef(false);
+  const [photoDeck, setPhotoDeck] = useState('all');
+  const photoDeckRef = useRef('all');
+  const deckGenerationRef = useRef(0);
+  const deckScanRef = useRef({ prev: null, prevEmitted: false });
+  const countedIdsRef = useRef(new Set());
 
   // ── Hint animation ─────────────────────────────────────────────────────────
   const hintAnim = useRef(new Animated.Value(0)).current;
@@ -497,16 +528,64 @@ export default function App() {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
   }, []);
 
-  // ── Load Initial Photos ────────────────────────────────────────────────────
-  useEffect(() => {
-    (async () => {
-      const { status } = await MediaLibrary.requestPermissionsAsync();
-      setHasPermission(status === 'granted');
-      if (status === 'granted') {
-        loadMorePhotos();
-        loadMoreVideos();
+  // Everything reviewed so far for a mode: earlier sessions + this session's swipes
+  const getReviewedSet = useCallback((mode) => {
+    const history = mode === 'photo' ? swipeHistoryRef.current : videoSwipeHistoryRef.current;
+    const set = new Set(reviewedBaseRef.current[mode]);
+    for (const h of history) if (h.assetId) set.add(h.assetId);
+    return set;
+  }, []);
+
+  // Restore reviewed IDs and the pending trash queue. Trashed assets are re-fetched
+  // so ones deleted outside the app are dropped instead of failing at delete time.
+  const restoreProgress = useCallback(async () => {
+    const saved = await loadProgress();
+    for (const mode of ['photo', 'video']) {
+      reviewedBaseRef.current[mode] = new Set(saved.reviewed[mode]);
+      const restored = (await Promise.all(saved.trash[mode].map(async ({ id, fileSize }) => {
+        try {
+          const asset = await MediaLibrary.getAssetInfoAsync(id);
+          return asset ? { asset, fileSize: fileSize ?? 0 } : null;
+        } catch {
+          return null;
+        }
+      }))).filter(Boolean);
+      for (const { asset, fileSize } of restored) {
+        trashCacheRef.current[mode].set(asset.id, { asset, fileSize });
       }
-    })();
+      const ids   = restored.map(r => r.asset.id);
+      const bytes = restored.reduce((acc, r) => acc + r.fileSize, 0);
+      if (mode === 'photo') { setTrashQueue(ids); setTrashSizeBytes(bytes); }
+      else                  { setVideoTrashQueue(ids); setVideoTrashSizeBytes(bytes); }
+    }
+    progressReadyRef.current = true;
+  }, []);
+
+  // Pages through the library until there's enough to swipe — filtered decks and
+  // already-reviewed assets can make whole pages come back empty.
+  const fetchUnreviewed = useCallback(async (mediaType, cursor, select, isStale) => {
+    const found = [];
+    let after = cursor;
+    let hasNext = true;
+    while (hasNext && found.length < PREFETCH_BATCH) {
+      const media = await MediaLibrary.getAssetsAsync({
+        first: PAGE_SIZE, mediaType,
+        sortBy: [[MediaLibrary.SortBy.creationTime, false]], after: after ?? undefined,
+      });
+      if (isStale()) return null;
+      // Tally total storage once per asset, however many decks rescan it
+      let newBytes = 0;
+      for (const a of media.assets) {
+        if (countedIdsRef.current.has(a.id)) continue;
+        countedIdsRef.current.add(a.id);
+        newBytes += a.fileSize ?? 0;
+      }
+      if (newBytes) setTotalStorageBytes(prev => prev + newBytes);
+      found.push(...select(media.assets));
+      after = media.endCursor;
+      hasNext = media.hasNextPage;
+    }
+    return { assets: found, endCursor: after, hasNextPage: hasNext };
   }, []);
 
   // FIX #3: loadMorePhotos uses ref for hasNextPage guard, not stale closure
@@ -514,24 +593,25 @@ export default function App() {
     if (!hasNextPageRef.current && cursor !== null) return;
     if (loadingMoreRef.current) return;
     loadingMoreRef.current = true;
+    const generation = deckGenerationRef.current;
+    const isStale = () => generation !== deckGenerationRef.current;
     try {
-      const media = await MediaLibrary.getAssetsAsync({
-        first: PAGE_SIZE, mediaType: 'photo',
-        sortBy: [[MediaLibrary.SortBy.creationTime, false]], after: cursor,
-      });
-      setPhotos(prev => [...prev, ...media.assets]);
-      setEndCursor(media.endCursor);
-      setHasNextPage(media.hasNextPage);
-      hasNextPageRef.current = media.hasNextPage;
-      endCursorRef.current = media.endCursor;
-      Image.prefetch(media.assets.slice(0, PREFETCH_BATCH).map(a => a.uri));
+      const reviewed = getReviewedSet('photo');
+      const page = await fetchUnreviewed('photo', cursor,
+        (assets) => selectForDeck(photoDeckRef.current, assets, deckScanRef.current, reviewed), isStale);
+      if (!page) return;
+      setPhotos(prev => [...prev, ...page.assets]);
+      setEndCursor(page.endCursor);
+      setHasNextPage(page.hasNextPage);
+      hasNextPageRef.current = page.hasNextPage;
+      endCursorRef.current = page.endCursor;
+      Image.prefetch(page.assets.slice(0, PREFETCH_BATCH).map(a => a.uri));
       setPhotosLoaded(true);
-      // Tally total storage from all loaded photo assets
-      setTotalStorageBytes(prev => prev + media.assets.reduce((acc, a) => acc + (a.fileSize ?? 0), 0));
     } finally {
-      loadingMoreRef.current = false;
+      // A deck switch mid-load hands the flag to the new load — don't clobber it
+      if (!isStale()) loadingMoreRef.current = false;
     }
-  }, []);
+  }, [getReviewedSet, fetchUnreviewed]);
 
   // FIX #3: loadMoreVideos uses ref for videoHasNextPage guard
   const loadMoreVideos = useCallback(async (cursor = null) => {
@@ -539,21 +619,58 @@ export default function App() {
     if (loadingMoreVideosRef.current) return;
     loadingMoreVideosRef.current = true;
     try {
-      const media = await MediaLibrary.getAssetsAsync({
-        first: PAGE_SIZE, mediaType: 'video',
-        sortBy: [[MediaLibrary.SortBy.creationTime, false]], after: cursor,
-      });
-      setVideos(prev => [...prev, ...media.assets]);
-      setVideoEndCursor(media.endCursor);
-      setVideoHasNextPage(media.hasNextPage);
-      videoHasNextPageRef.current = media.hasNextPage;
-      videoEndCursorRef.current = media.endCursor;
+      const reviewed = getReviewedSet('video');
+      const page = await fetchUnreviewed('video', cursor,
+        (assets) => assets.filter(a => !reviewed.has(a.id)), () => false);
+      setVideos(prev => [...prev, ...page.assets]);
+      setVideoEndCursor(page.endCursor);
+      setVideoHasNextPage(page.hasNextPage);
+      videoHasNextPageRef.current = page.hasNextPage;
+      videoEndCursorRef.current = page.endCursor;
       setVideosLoaded(true);
-      setTotalStorageBytes(prev => prev + media.assets.reduce((acc, a) => acc + (a.fileSize ?? 0), 0));
     } finally {
       loadingMoreVideosRef.current = false;
     }
-  }, []);
+  }, [getReviewedSet, fetchUnreviewed]);
+
+  // ── Load Initial Photos ────────────────────────────────────────────────────
+  useEffect(() => {
+    (async () => {
+      const { status } = await MediaLibrary.requestPermissionsAsync();
+      setHasPermission(status === 'granted');
+      if (status === 'granted') {
+        await restoreProgress();
+        loadMorePhotos();
+        loadMoreVideos();
+      }
+    })();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Save progress (debounced) ──────────────────────────────────────────────
+  useEffect(() => {
+    if (!progressReadyRef.current) return;
+    const timer = setTimeout(() => {
+      const trashFor = (mode, queue, history) => queue.map(id => ({
+        id,
+        fileSize: history.find(h => h.assetId === id && h.dir === 'left')?.fileSize
+               ?? trashCacheRef.current[mode].get(id)?.fileSize ?? 0,
+      }));
+      saveProgress({
+        reviewed: { photo: [...getReviewedSet('photo')], video: [...getReviewedSet('video')] },
+        trash: {
+          photo: trashFor('photo', trashQueue, swipeHistory),
+          video: trashFor('video', videoTrashQueue, videoSwipeHistory),
+        },
+      });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [trashQueue, videoTrashQueue, swipeHistory, videoSwipeHistory, getReviewedSet]);
+
+  // Folds this session's swipes into the persisted base so clearing history
+  // (empty trash, deck switch) doesn't make reviewed assets reappear.
+  const commitHistory = useCallback((mode) => {
+    reviewedBaseRef.current[mode] = getReviewedSet(mode);
+  }, [getReviewedSet]);
 
   const resetOverlays = useCallback(() => {
     Animated.parallel([
@@ -769,16 +886,98 @@ export default function App() {
   }, []);
 
   const handleRescue = useCallback((assetId) => {
+    // Restored / deck-switched items have no history entry — fall back to the cache
+    const cached = trashCacheRef.current[mediaModeRef.current].get(assetId);
     if (mediaModeRef.current === 'photo') {
       setTrashQueue(q => q.filter(id => id !== assetId));
-      const entry = swipeHistoryRef.current.find(h => h.assetId === assetId && h.dir === 'left');
+      const entry = swipeHistoryRef.current.find(h => h.assetId === assetId && h.dir === 'left') ?? cached;
       if (entry?.fileSize) setTrashSizeBytes(prev => Math.max(0, prev - entry.fileSize));
     } else {
       setVideoTrashQueue(q => q.filter(id => id !== assetId));
-      const entry = videoSwipeHistoryRef.current.find(h => h.assetId === assetId && h.dir === 'left');
+      const entry = videoSwipeHistoryRef.current.find(h => h.assetId === assetId && h.dir === 'left') ?? cached;
       if (entry?.fileSize) setVideoTrashSizeBytes(prev => Math.max(0, prev - entry.fileSize));
     }
+    // Rescued items stay reviewed (they were looked at), so they don't come back
+    reviewedBaseRef.current[mediaModeRef.current].add(assetId);
+    trashCacheRef.current[mediaModeRef.current].delete(assetId);
   }, []);
+
+  // Stash trashed assets from this session so the review modal can still show
+  // them after history is cleared or the deck is reloaded.
+  const stashTrashed = useCallback((mode) => {
+    const history = mode === 'photo' ? swipeHistoryRef.current : videoSwipeHistoryRef.current;
+    const assets  = mode === 'photo' ? photosRef.current : videosRef.current;
+    const queue   = mode === 'photo' ? trashQueue : videoTrashQueue;
+    for (const h of history) {
+      if (h.dir !== 'left' || !queue.includes(h.assetId)) continue;
+      const asset = assets.find(a => a.id === h.assetId);
+      if (asset) trashCacheRef.current[mode].set(asset.id, { asset, fileSize: h.fileSize ?? 0 });
+    }
+  }, [trashQueue, videoTrashQueue]);
+
+  // Reload the photo deck from the newest photo; the trash queue is kept.
+  // Undo can't cross a reload, so this session's history is folded in first.
+  const restartPhotoDeck = useCallback((deck) => {
+    stashTrashed('photo');
+    commitHistory('photo');
+    setSwipeHistory([]);
+    swipeHistoryRef.current = [];
+
+    deckGenerationRef.current += 1;
+    loadingMoreRef.current = false;
+    deckScanRef.current = { prev: null, prevEmitted: false };
+    photoDeckRef.current = deck;
+    setPhotoDeck(deck);
+
+    photosRef.current = [];
+    photoTrimOffsetRef.current = 0;
+    hasNextPageRef.current = true;
+    endCursorRef.current = null;
+    cardIndexRef.current = 0;
+    setPhotos([]);
+    setCardIndex(0);
+    setHasNextPage(true);
+    setEndCursor(null);
+    setPhotosLoaded(false);
+    resetOverlays();
+    loadMorePhotos();
+  }, [stashTrashed, commitHistory, resetOverlays, loadMorePhotos]);
+
+  const handleDeckCycle = useCallback(() => {
+    const idx = PHOTO_DECKS.findIndex(d => d.key === photoDeckRef.current);
+    restartPhotoDeck(PHOTO_DECKS[(idx + 1) % PHOTO_DECKS.length].key);
+  }, [restartPhotoDeck]);
+
+  // Long-press the storage pill: forget review progress and start over
+  const handleResetProgress = useCallback(() => {
+    Alert.alert('Start over?', 'Photos and videos you already reviewed will show up again. Your trash queue is kept.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Start over', style: 'destructive', onPress: async () => {
+          await clearProgress();
+          stashTrashed('photo');
+          stashTrashed('video');
+          // Trashed items stay out of the decks until they're deleted or rescued
+          reviewedBaseRef.current = { photo: new Set(trashQueue), video: new Set(videoTrashQueue) };
+          swipeHistoryRef.current = [];
+          videoSwipeHistoryRef.current = [];
+          setVideoSwipeHistory([]);
+          restartPhotoDeck(photoDeckRef.current);
+
+          activePlayerRef.current?.pause();
+          videosRef.current = [];
+          videoTrimOffsetRef.current = 0;
+          videoHasNextPageRef.current = true;
+          videoCardIndexRef.current = 0;
+          setVideos([]);
+          setVideoCardIndex(0);
+          setVideoHasNextPage(true);
+          setVideoEndCursor(null);
+          setVideosLoaded(false);
+          loadMoreVideos();
+        },
+      },
+    ]);
+  }, [trashQueue, videoTrashQueue, stashTrashed, restartPhotoDeck, loadMoreVideos]);
 
   const handleEmptyTrash = useCallback(() => {
     const isPhoto = mediaModeRef.current === 'photo';
@@ -789,6 +988,9 @@ export default function App() {
       { text: 'Delete', style: 'destructive', onPress: async () => {
           try {
             await MediaLibrary.deleteAssetsAsync(queue);
+            const mode = isPhoto ? 'photo' : 'video';
+            commitHistory(mode);
+            trashCacheRef.current[mode].clear();
             if (isPhoto) {
               setTrashQueue([]); setTrashSizeBytes(0); setSwipeHistory([]);
             } else {
@@ -800,7 +1002,7 @@ export default function App() {
         }
       },
     ]);
-  }, [trashQueue, videoTrashQueue]);
+  }, [trashQueue, videoTrashQueue, commitHistory]);
 
   if (hasPermission === null) return <SplashScreen icon="ellipsis-horizontal" message="Requesting permissions…" />;
   if (hasPermission === false) return <SplashScreen icon="lock-closed-outline" message="No access to camera roll." subtitle="Enable in Settings → Privacy → Photos" />;
@@ -815,6 +1017,27 @@ export default function App() {
 
   const activePhoto = activeAssets[activeIndex];
   const allSwiped   = activeIndex >= activeAssets.length && !activeHasNext;
+
+  const emptyDeckMessage = {
+    all:         reviewedBaseRef.current.photo.size > 0 ? 'All caught up!' : 'No photos found',
+    screenshots: 'No screenshots to review',
+    similar:     'No similar shots to review',
+  }[photoDeck];
+  const emptyDeckSubtitle = reviewedBaseRef.current.photo.size > 0
+    ? 'Long-press the storage pill to start over'
+    : undefined;
+
+  // Review modal also needs trashed assets that aren't in the current deck
+  const trashCache   = [...trashCacheRef.current[mediaMode].values()];
+  const reviewAssets = [
+    ...trashCache.map(c => c.asset),
+    ...(mediaMode === 'photo' ? photosRef.current : videosRef.current)
+      .filter(a => !trashCacheRef.current[mediaMode].has(a.id)),
+  ];
+  const reviewHistory = [
+    ...trashCache.map(c => ({ dir: 'left', assetId: c.asset.id, fileSize: c.fileSize })),
+    ...activeHistory,
+  ];
 
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
@@ -831,7 +1054,8 @@ export default function App() {
       >
         <MediaToggle mode={mediaMode} onChange={handleModeChange} />
         <View style={styles.topBarRow}>
-          <StoragePill savedBytes={activeSavedBytes} totalBytes={totalStorageBytes} />
+          <StoragePill savedBytes={activeSavedBytes} totalBytes={totalStorageBytes} onLongPress={handleResetProgress} />
+          {mediaMode === 'photo' && <DeckPill deck={photoDeck} onPress={handleDeckCycle} />}
           {mediaMode === 'video' && (
             <TouchableOpacity onPress={toggleMute} activeOpacity={0.7}>
               <BlurView intensity={50} tint="dark" style={styles.muteButton}>
@@ -852,10 +1076,16 @@ export default function App() {
 
       {/* Deck Area */}
       <View style={styles.deckArea} pointerEvents="box-none">
-        {mediaMode === 'photo' && photosLoaded && photos.length === 0 ? (
-          <SplashScreen icon="images-outline" message="No photos found" />
-        ) : mediaMode === 'video' && videosLoaded && videos.length === 0 ? (
-          <SplashScreen icon="videocam-outline" message="No videos found" />
+        {mediaMode === 'photo' && !photosLoaded ? (
+          <SplashScreen icon="images-outline" message="Loading photos…" pulse />
+        ) : mediaMode === 'photo' && photos.length === 0 ? (
+          <SplashScreen icon="images-outline" message={emptyDeckMessage} subtitle={emptyDeckSubtitle} />
+        ) : mediaMode === 'video' && !videosLoaded ? (
+          <SplashScreen icon="videocam-outline" message="Loading videos…" pulse />
+        ) : mediaMode === 'video' && videos.length === 0 ? (
+          reviewedBaseRef.current.video.size > 0
+            ? <SplashScreen icon="checkmark-circle" message="All caught up!" subtitle="Long-press the storage pill to start over" />
+            : <SplashScreen icon="videocam-outline" message="No videos found" />
         ) : allSwiped ? (
           <SplashScreen icon="checkmark-circle" message="All caught up!" subtitle="Nothing left to review" />
         ) : (
@@ -997,8 +1227,8 @@ export default function App() {
       <TrashReviewModal
         visible={reviewVisible}
         trashQueue={activeTrashQ}
-        photos={mediaMode === 'photo' ? photosRef.current : videosRef.current}
-        swipeHistory={activeHistory}
+        photos={reviewAssets}
+        swipeHistory={reviewHistory}
         onClose={() => setReviewVisible(false)}
         onRescue={handleRescue}
       />
