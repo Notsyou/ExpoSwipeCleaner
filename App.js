@@ -1133,6 +1133,15 @@ export default function App() {
                 <CardEntrance>
                   <View style={styles.card}>
                     <Image source={{ uri: card.uri }} style={styles.cardImage} contentFit="contain" transition={220} />
+                    {card.labels && (
+                      <View style={styles.labelRow} pointerEvents="none">
+                        {[card.labels.source, card.labels.duplicate].map(label => (
+                          <BlurView key={label} intensity={52} tint="dark" style={styles.labelChip}>
+                            <Text style={styles.durationText}>{label}</Text>
+                          </BlurView>
+                        ))}
+                      </View>
+                    )}
                   </View>
                 </CardEntrance>
               );
@@ -1299,6 +1308,14 @@ const styles = StyleSheet.create({
   durationBadge: {
     position: 'absolute', bottom: 56, left: 14,
     flexDirection: 'row', alignItems: 'center', gap: 5,
+    borderRadius: 12,
+    paddingHorizontal: 10, paddingVertical: 5,
+    overflow: 'hidden',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(255,255,255,0.13)',
+  },
+  labelRow: { position: 'absolute', top: 14, left: 14, flexDirection: 'row', gap: 6 },
+  labelChip: {
     borderRadius: 12,
     paddingHorizontal: 10, paddingVertical: 5,
     overflow: 'hidden',
