@@ -20,6 +20,7 @@ import * as MediaLibrary from 'expo-media-library/legacy';
 // The API surface is identical to the old expo-file-system.
 import * as FileSystem from 'expo-file-system/legacy';
 import { File } from 'expo-file-system';
+import { fileAssetFromId, isFileAsset } from '../lib/sources';
 
 import {
   SCREEN_WIDTH,
@@ -38,6 +39,8 @@ import {
 //   • localUri is a real file:// path; ph:// (photo.uri) must NOT be used here.
 //
 export const fetchAssetInfo = async (assetId, _uri) => {
+  // Files-app items (iOS Downloads folder) aren't in the photo library
+  if (isFileAsset(assetId)) return fileAssetFromId(assetId);
   try {
     // Step 1 — local (no network), fastest path
     const local = await MediaLibrary.getAssetInfoAsync(assetId, {

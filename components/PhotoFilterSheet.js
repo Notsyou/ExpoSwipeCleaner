@@ -1,10 +1,11 @@
 import { Ionicons } from '@expo/vector-icons';
 import { BlurView } from 'expo-blur';
 import { useEffect, useState } from 'react';
-import { Animated, Easing, Modal, Pressable, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Alert, Animated, Easing, Modal, Pressable, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
 import { GLASS_BORDER, SAFE_BOTTOM, SCREEN_HEIGHT } from '../constants';
 import { PHOTO_DECKS, PHOTO_TYPES } from '../lib/progress';
+import { getSavedFolder, IS_IOS, listUserAlbums, pickFilesFolder } from '../lib/sources';
 
 const OPEN_MS = 260;
 const CLOSE_MS = 200;
@@ -34,7 +35,26 @@ const ChipGroup = ({ title, options, selected, onSelect }) => (
 
 // Choosing an option applies it and closes the sheet. The X, a tap outside the
 // sheet and the Android back button close it without changing anything.
-export default function PhotoFilterSheet({ visible, deck, type, onChange, onClose }) {
+export default function PhotoFilterSheet({ visible, deck, type, onChange, onClose, folderAccessLost, onFolderPicked }) {
+  const [albums, setAlbums] = useState([]);
+  const [folderName, setFolderName] = useState(null);
+
+  // Refresh albums and the picked folder each time the sheet opens
+  useEffect(() => {
+    if (!visible) return;
+    listUserAlbums().then(setAlbums);
+    if (IS_IOS) getSavedFolder().then(uri => setFolderName(uri ? decodeURIComponent(uri.replace(/\/$/, '').split('/').pop()) : null));
+  }, [visible]);
+
+  const pickFolder = async () => {
+    try {
+      const uri = await pickFilesFolder();
+      if (uri) onFolderPicked?.();
+    } catch {
+      Alert.alert('Folder not available', "Couldn't open that folder. Try choosing it again.");
+    }
+  };
+
   // Stays rendered after `visible` turns false so the close animation can finish
   const [mounted, setMounted] = useState(false);
   const [progress] = useState(() => new Animated.Value(0));
@@ -72,6 +92,28 @@ export default function PhotoFilterSheet({ visible, deck, type, onChange, onClos
           </TouchableOpacity>
           <ChipGroup title="Show" options={PHOTO_DECKS} selected={deck} onSelect={key => onChange(key, type)} />
           <ChipGroup title="File type" options={PHOTO_TYPES} selected={type} onSelect={key => onChange(deck, key)} />
+          {albums.length > 0 && (
+            <ScrollView style={styles.albumScroll} nestedScrollEnabled>
+              <ChipGroup
+                title="Albums"
+                options={albums}
+                selected={deck}
+                onSelect={key => onChange(key, type, albums.find(a => a.key === key)?.label ?? null)}
+              />
+            </ScrollView>
+          )}
+          {IS_IOS && (
+            <View style={styles.group}>
+              <Text style={styles.title}>Files app folder (shown in Downloads)</Text>
+              <TouchableOpacity onPress={pickFolder} activeOpacity={0.7} accessibilityRole="button" style={[styles.chip, styles.folderChip]}>
+                <Ionicons name={folderAccessLost ? 'alert-circle-outline' : 'folder-open-outline'} size={16} color="rgba(255,255,255,0.85)" />
+                <Text style={styles.chipText} numberOfLines={1}>
+                  {folderAccessLost ? `Access to ${folderName ?? 'folder'} lost, choose it again`
+                    : folderName ? `${folderName} · Change` : 'Choose a folder (e.g. Downloads)'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          )}
         </BlurView>
       </Animated.View>
     </Modal>
@@ -96,6 +138,8 @@ const styles = StyleSheet.create({
     minHeight: 44, justifyContent: 'center', paddingHorizontal: 16, borderRadius: 22,
     backgroundColor: 'rgba(255,255,255,0.08)', ...GLASS_BORDER,
   },
+  albumScroll: { maxHeight: 160 },
+  folderChip: { flexDirection: 'row', alignItems: 'center', gap: 8, alignSelf: 'flex-start' },
   chipSelected: { backgroundColor: 'rgba(255,255,255,0.9)' },
   chipText: { color: 'rgba(255,255,255,0.85)', fontSize: 14, fontWeight: '500' },
   chipTextSelected: { color: '#000', fontWeight: '600' },

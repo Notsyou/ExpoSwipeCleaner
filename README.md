@@ -11,10 +11,21 @@ Built with [Expo](https://expo.dev) (SDK 58, React Native 0.88).
 - **Undo:** step back through your last swipes.
 - **Saved progress:** items you've already kept or trashed don't come back next time you open the app, and the trash queue survives restarts. Long-press the storage pill to start over.
 - **Photo filters:** tap the filter pill at the top to choose:
-  - **Show:** All, Screenshots, or Similar (burst-style shots taken within 3 seconds of each other)
+  - **Show:** All, Camera, Screenshots, Downloads, Pictures (Android only), or Similar (burst-style shots taken within 3 seconds of each other)
   - **File type:** All, JPEG, PNG, HEIC/HEIF, or Other
+  - **Albums:** any album with photos in it (WhatsApp, Instagram, …). On Android these are your folders.
+  - **Files app folder (iOS, development build only):** pick a folder once, e.g. Downloads, and its images show up under Downloads.
+
+  How the sources are detected:
+
+  | | Android | iOS |
+  |---|---|---|
+  | Screenshots | `Screenshots/` folder or filename | built-in Screenshots album |
+  | Camera | `DCIM/Camera/` or camera filenames | camera make/model in the photo's EXIF |
+  | Downloads | `Download/` folder | photos without camera EXIF (saved from Safari/apps), plus the picked Files folder |
+
   Undo and the trash review keep working when you switch filters partway through.
-- **Source labels:** chips at the bottom right of each photo show where it came from (screenshot / camera / other) and whether it has a duplicate.
+- **Source labels:** chips at the bottom right of each photo show where it came from (screenshot / camera / download / pictures / other) and whether it has a duplicate.
 - **Metadata panel:** file size, resolution and date for the current item.
 
 ---
@@ -106,6 +117,43 @@ A QR code and an `exp://<your-pc-ip>:8081` address appear in the terminal.
 **7. Grant photo access** when the app asks (on iPhone choose **Allow Full Access**, otherwise the app only sees the photos you picked), and start swiping.
 
 After a code change, Metro reloads the app on its own. If it doesn't, shake the phone and tap **Reload**.
+
+---
+
+## Logged-out and offline mode
+
+Everything works without an Expo account. Option A above is already logged out; this section sums up the rules and adds **offline mode** for when the PC has no internet.
+
+### Logged out (no Expo account)
+
+1. Log the CLI out, and keep it out:
+   ```bash
+   npx expo whoami     # should say "Not logged in"
+   npx expo logout     # only if it shows a username
+   ```
+2. Make sure no token logs it back in. `EXPO_TOKEN` overrides `logout`:
+   ```bash
+   echo $EXPO_TOKEN    # should print nothing
+   unset EXPO_TOKEN    # bash/zsh;  fish: set -e EXPO_TOKEN
+   ```
+   On the home server, leave `EXPO_TOKEN` empty in Portainer or `.env`.
+3. **Sign Expo Go out too** (Expo Go → profile → Sign out). A logged-in Expo Go with a logged-out CLI shows an account error.
+4. Start Metro and open the project by QR code or by typing `exp://<pc-ip>:8081` into **Enter URL manually**. Logged out, the project won't appear in Expo Go's list by itself.
+
+### Offline (no internet on the PC)
+
+`--offline` makes Metro skip every request to Expo's servers (version checks, account lookups, manifest signing) and serve an unsigned manifest instead. The phone still needs to reach the PC over Wi-Fi/LAN or ZeroTier/Tailscale; only the internet is optional.
+
+```bash
+npx expo start --offline
+# with the home-server address:
+REACT_NATIVE_PACKAGER_HOSTNAME=192.168.254.140 npx expo start --offline
+```
+
+- Run `npm install` **once while online** first; after that, no downloads are needed.
+- `--tunnel` and `eas update` need the internet, so they don't work offline.
+- Expo Go itself doesn't need to be online, but it must already be installed and on the matching SDK.
+- If you're **logged out**, add `--offline` anyway when the internet is flaky: it stops Metro from hanging on Expo's servers at startup.
 
 ---
 
@@ -246,6 +294,9 @@ Apps pick the update up the next time they launch. Changing native code (new nat
 | **Metadata panel is empty / no file sizes** | Expo Go limitation on Android. Use a development build. |
 | **Opens with an error about logging in / account** | The Expo CLI (or the server's `EXPO_TOKEN`) and Expo Go are on different accounts. Sign Expo Go in to the same account, or sign both out. Restart Metro after changing the CLI login. |
 | **Old photos keep showing up / want to start fresh** | Long-press the storage pill → *Start over*. |
+| **An album says "already reviewed" / "can't see the photos"** | Reviewed photos are hidden in every deck: long-press the storage pill to start over. "Can't see" means iOS access is set to Selected Photos: Settings → Privacy → Photos → **Full Access**. |
+| **"Encountered two children with the same key"** or other swiper errors after updating | The swiper patch didn't apply. Run `npm install`, then restart Metro with `npx expo start -c`. |
+| **Metro hangs at startup without internet** | Use `npx expo start --offline`. |
 
 ---
 
@@ -254,9 +305,11 @@ Apps pick the update up the next time they launch. Changing native code (new nat
 ```
 App.js                     main screen: decks, swiping, video player, trash flow
 lib/progress.js            saved progress (AsyncStorage) and smart-deck filters
+lib/sources.js             iOS screenshots album, EXIF camera check, albums, Files-app folder
 components/
   ActionButtons.js         undo / review / empty-trash buttons
   MetadataPanel.js         size, resolution and date of the current item
+  PhotoFilterSheet.js      filter sheet: decks, file types, albums, Files folder
   TrashReviewModal.js      review & rescue queued items
 constants.js               layout sizes, paging limits, formatters
 patches/                   patch-package fixes for third-party libraries

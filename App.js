@@ -16,7 +16,11 @@ import ActionButtons from './components/ActionButtons';
 import MetadataPanel from './components/MetadataPanel';
 import PhotoFilterSheet from './components/PhotoFilterSheet';
 import TrashReviewModal from './components/TrashReviewModal';
-import { clearProgress, loadProgress, PHOTO_DECKS, PHOTO_TYPES, saveProgress, selectForDeck } from './lib/progress';
+import { clearProgress, isScreenshot, loadProgress, needsExif, PHOTO_DECKS, PHOTO_TYPES, saveProgress, selectForDeck } from './lib/progress';
+import {
+  albumIdOf, deleteFileAssets, enrichWithExif, fileAssetFromId, getSavedFolder, getScreenshotsAlbum,
+  IS_IOS, isAlbumDeck, isFileAsset, listFolderImages,
+} from './lib/sources';
 import { listenForReminderTaps, refreshReminder } from './lib/reminder';
 import {
   CARD_HEIGHT,
@@ -62,8 +66,10 @@ const StoragePill = ({ savedBytes, totalBytes, onLongPress }) => {
 
 // ─── DeckPill ─────────────────────────────────────────────────────────────────
 // Shows the active photo filters; tap opens the filter sheet
-const DeckPill = ({ deck, type, onPress }) => {
-  const current = PHOTO_DECKS.find(d => d.key === deck) ?? PHOTO_DECKS[0];
+const DeckPill = ({ deck, type, albumTitle, onPress }) => {
+  const current = isAlbumDeck(deck)
+    ? { key: deck, label: albumTitle ?? 'Album', icon: 'folder-outline' }
+    : PHOTO_DECKS.find(d => d.key === deck) ?? PHOTO_DECKS[0];
   const typeLabel = PHOTO_TYPES.find(t => t.key === type)?.label;
   const label = type === 'all' ? current.label
     : deck === 'all' ? typeLabel
@@ -319,6 +325,12 @@ export default function App() {
   const [photoType, setPhotoType] = useState('all');
   const photoTypeRef = useRef('all');
   const [filterSheetOpen, setFilterSheetOpen] = useState(false);
+  // iOS revoked access to the picked Files folder (usually after a restart)
+  const [folderAccessLost, setFolderAccessLost] = useState(false);
+  const [albumTitle, setAlbumTitle] = useState(null);
+  // iOS "Selected Photos" access: albums only show the photos the user picked
+  const [limitedAccess, setLimitedAccess] = useState(false);
+  const [scanStats, setScanStats] = useState({ scanned: 0, reviewedSkipped: 0 });
   const deckGenerationRef = useRef(0);
   const deckScanRef = useRef({ prev: null, prevEmitted: false });
   const countedIdsRef = useRef(new Set());
@@ -385,12 +397,9 @@ export default function App() {
   useEffect(() => { videoEndCursorRef.current = videoEndCursor; }, [videoEndCursor]);
   useEffect(() => {
     photosLengthRef.current = photos.length;
-    // Merge into photosRef so we always have the full unsliced set for modal lookups
-    const currentIds = new Set(photos.map(p => p.id));
-    photosRef.current = [
-      ...photosRef.current.filter(p => !currentIds.has(p.id)),
-      ...photos,
-    ];
+    // Only the in-memory deck. Trashed photos live in trashCacheRef, so trimmed
+    // cards can be released instead of piling up for the whole session.
+    photosRef.current = photos;
   }, [photos]);
   useEffect(() => { videosLengthRef.current = videos.length; videosRef.current = videos; }, [videos]);
 
@@ -584,6 +593,10 @@ export default function App() {
       reviewedBaseRef.current[mode] = new Set(saved.reviewed[mode]);
       const restored = (await Promise.all(saved.trash[mode].map(async ({ id, fileSize }) => {
         try {
+          if (isFileAsset(id)) {
+            const asset = fileAssetFromId(id);
+            return asset ? { asset, fileSize: fileSize ?? asset.fileSize } : null;
+          }
           const asset = await MediaLibrary.getAssetInfoAsync(id);
           return asset ? { asset, fileSize: fileSize ?? 0 } : null;
         } catch {
@@ -603,13 +616,14 @@ export default function App() {
 
   // Pages through the library until there's enough to swipe — filtered decks and
   // already-reviewed assets can make whole pages come back empty.
-  const fetchUnreviewed = useCallback(async (mediaType, cursor, select, isStale) => {
+  // `album` narrows the query; `enrich` runs on not-yet-reviewed assets before `select`.
+  const fetchUnreviewed = useCallback(async (mediaType, cursor, select, isStale, { album, enrich, reviewed } = {}) => {
     const found = [];
     let after = cursor;
     let hasNext = true;
     while (hasNext && found.length < PREFETCH_BATCH) {
       const media = await MediaLibrary.getAssetsAsync({
-        first: PAGE_SIZE, mediaType,
+        first: PAGE_SIZE, mediaType, album: album ?? undefined,
         sortBy: [[MediaLibrary.SortBy.creationTime, false]], after: after ?? undefined,
       });
       if (isStale()) return null;
@@ -621,6 +635,10 @@ export default function App() {
         newBytes += a.fileSize ?? 0;
       }
       if (newBytes) setTotalStorageBytes(prev => prev + newBytes);
+      if (enrich) {
+        await enrich(reviewed ? media.assets.filter(a => !reviewed.has(a.id)) : media.assets);
+        if (isStale()) return null;
+      }
       found.push(...select(media.assets));
       after = media.endCursor;
       hasNext = media.hasNextPage;
@@ -637,9 +655,35 @@ export default function App() {
     const isStale = () => generation !== deckGenerationRef.current;
     try {
       const reviewed = getReviewedSet('photo');
-      const page = await fetchUnreviewed('photo', cursor,
-        (assets) => selectForDeck(photoDeckRef.current, assets, deckScanRef.current, reviewed, photoTypeRef.current), isStale);
+      const deck = photoDeckRef.current;
+      const select = (assets) => {
+        // Counted so an empty deck can say *why* it's empty
+        const scan = deckScanRef.current;
+        scan.scanned = (scan.scanned ?? 0) + assets.length;
+        scan.reviewedSkipped = (scan.reviewedSkipped ?? 0) + assets.filter(a => reviewed.has(a.id)).length;
+        return selectForDeck(deck, assets, scan, reviewed, photoTypeRef.current);
+      };
+      let album = albumIdOf(deck);
+      // iOS keeps screenshots in a smart album, so query it directly instead of scanning everything
+      if (!album && deck === 'screenshots') album = (await getScreenshotsAlbum())?.id ?? null;
+      if (isStale()) return;
+      const page = await fetchUnreviewed('photo', cursor, select, isStale, {
+        // Screenshots never count as camera or download, so skip their EXIF lookup
+        album, reviewed, enrich: needsExif(deck) ? (assets) => enrichWithExif(assets.filter(a => !isScreenshot(a))) : null,
+      });
       if (!page) return;
+      // iOS Downloads also includes the Files-app folder the user picked, shown first
+      if (IS_IOS && deck === 'downloads' && cursor === null) {
+        const folder = await getSavedFolder();
+        if (isStale()) return;
+        if (folder) {
+          try {
+            page.assets.unshift(...select(listFolderImages(folder)));
+          } catch {
+            setFolderAccessLost(true);
+          }
+        }
+      }
       // An undone photo sits in the deck already and can also turn up in a later page
       setPhotos(prev => {
         const present = new Set(prev.map(p => p.id));
@@ -650,6 +694,8 @@ export default function App() {
       hasNextPageRef.current = page.hasNextPage;
       endCursorRef.current = page.endCursor;
       Image.prefetch(page.assets.slice(0, PREFETCH_BATCH).map(a => a.uri));
+      const { scanned = 0, reviewedSkipped = 0 } = deckScanRef.current;
+      setScanStats({ scanned, reviewedSkipped });
       setPhotosLoaded(true);
     } finally {
       // A deck switch mid-load hands the flag to the new load — don't clobber it
@@ -680,8 +726,9 @@ export default function App() {
   // ── Load Initial Photos ────────────────────────────────────────────────────
   useEffect(() => {
     (async () => {
-      const { status } = await MediaLibrary.requestPermissionsAsync();
+      const { status, accessPrivileges } = await MediaLibrary.requestPermissionsAsync();
       setHasPermission(status === 'granted');
+      setLimitedAccess(accessPrivileges === 'limited');
       if (status === 'granted') {
         await restoreProgress();
         loadMorePhotos();
@@ -739,10 +786,11 @@ export default function App() {
   const videoTrimOffsetRef = useRef(0);
 
   // FIX #7: Wrap all swipe handlers in useCallback with stable deps (refs only)
-  const handleSwipeLeft = useCallback((swiperIndex) => {
+  // The Swiper passes the swiped card itself; prefer it over an index lookup,
+  // which can be off by a trim chunk while a trim is in flight.
+  const handleSwipeLeft = useCallback((swiperIndex, card) => {
     if (mediaModeRef.current === 'photo') {
-      const photo = photosRef.current[swiperIndex + photoTrimOffsetRef.current]
-                 ?? photosRef.current[swiperIndex];
+      const photo = card ?? photosRef.current[swiperIndex];
       if (!photo?.id) return;
       const fileSize = activeAssetInfoRef.current?.fileSize ?? 0;
       setTrashQueue(prev => {
@@ -753,8 +801,7 @@ export default function App() {
       setSwipeHistory(prev => [...prev, { dir: 'left', assetId: photo.id, fileSize, asset: photo, generation: deckGenerationRef.current }]);
       setTrashSizeBytes(prev => prev + fileSize);
     } else {
-      const video = videosRef.current[swiperIndex + videoTrimOffsetRef.current]
-                 ?? videosRef.current[swiperIndex];
+      const video = card ?? videosRef.current[swiperIndex];
       if (!video?.id) return;
       const fileSize = activeAssetInfoRef.current?.fileSize ?? 0;
       setVideoTrashQueue(prev => {
@@ -767,19 +814,13 @@ export default function App() {
     playTrash();
   }, [playTrash]);
 
-  const handleSwipeRight = useCallback((swiperIndex) => {
+  const handleSwipeRight = useCallback((swiperIndex, card) => {
     if (mediaModeRef.current === 'photo') {
-      setPhotos(currentPhotos => {
-        const photo = currentPhotos[swiperIndex];
-        setSwipeHistory(prev => [...prev, { dir: 'right', assetId: photo?.id, fileSize: 0, asset: photo, generation: deckGenerationRef.current }]);
-        return currentPhotos;
-      });
+      const photo = card ?? photosRef.current[swiperIndex];
+      setSwipeHistory(prev => [...prev, { dir: 'right', assetId: photo?.id, fileSize: 0, asset: photo, generation: deckGenerationRef.current }]);
     } else {
-      setVideos(currentVideos => {
-        const video = currentVideos[swiperIndex];
-        setVideoSwipeHistory(prev => [...prev, { dir: 'right', assetId: video?.id, fileSize: 0 }]);
-        return currentVideos;
-      });
+      const video = card ?? videosRef.current[swiperIndex];
+      setVideoSwipeHistory(prev => [...prev, { dir: 'right', assetId: video?.id, fileSize: 0 }]);
     }
     playKeep();
   }, [playKeep]);
@@ -973,7 +1014,7 @@ export default function App() {
     const queue   = mode === 'photo' ? trashQueue : videoTrashQueue;
     for (const h of history) {
       if (h.dir !== 'left' || !queue.includes(h.assetId)) continue;
-      const asset = assets.find(a => a.id === h.assetId);
+      const asset = h.asset ?? assets.find(a => a.id === h.assetId);
       if (asset) trashCacheRef.current[mode].set(asset.id, { asset, fileSize: h.fileSize ?? 0 });
     }
   }, [trashQueue, videoTrashQueue]);
@@ -1010,11 +1051,19 @@ export default function App() {
     loadMorePhotos();
   }, [stashTrashed, commitHistory, resetOverlays, loadMorePhotos]);
 
-  const handleFilterChange = useCallback((deck, type) => {
+  const handleFilterChange = useCallback((deck, type, title) => {
     setFilterSheetOpen(false);
+    if (title !== undefined) setAlbumTitle(title);
     // Reloading restarts the deck, so don't do it for an unchanged selection
     if (deck === photoDeckRef.current && type === photoTypeRef.current) return;
     restartPhotoDeck(deck, type, true);
+  }, [restartPhotoDeck]);
+
+  // iOS: a Files-app folder was (re)picked — show it under Downloads
+  const handleFolderPicked = useCallback(() => {
+    setFolderAccessLost(false);
+    setFilterSheetOpen(false);
+    restartPhotoDeck('downloads', photoTypeRef.current, true);
   }, [restartPhotoDeck]);
 
   // Long-press the storage pill: forget review progress and start over
@@ -1056,7 +1105,10 @@ export default function App() {
       { text: 'Cancel', style: 'cancel' },
       { text: 'Delete', style: 'destructive', onPress: async () => {
           try {
-            await MediaLibrary.deleteAssetsAsync(queue);
+            // Files-app items are plain files; the rest go through the photo library
+            const libraryIds = queue.filter(id => !isFileAsset(id));
+            if (libraryIds.length) await MediaLibrary.deleteAssetsAsync(libraryIds);
+            deleteFileAssets(queue.filter(isFileAsset));
             const mode = isPhoto ? 'photo' : 'video';
             commitHistory(mode);
             trashCacheRef.current[mode].clear();
@@ -1091,22 +1143,43 @@ export default function App() {
   const typeLabel = photoType === 'other' ? 'other file type' : PHOTO_TYPES.find(t => t.key === photoType)?.label;
   const emptyDeckMessage = typeFiltered ? {
     all:         `No ${typeLabel} photos to review`,
+    camera:      `No ${typeLabel} camera photos to review`,
     screenshots: `No ${typeLabel} screenshots to review`,
+    downloads:   `No ${typeLabel} downloads to review`,
+    pictures:    `No ${typeLabel} pictures to review`,
     similar:     `No similar ${typeLabel} shots to review`,
   }[photoDeck] : {
     all:         reviewedBaseRef.current.photo.size > 0 ? 'All caught up!' : 'No photos found',
+    camera:      'No camera photos to review',
     screenshots: 'No screenshots to review',
+    downloads:   'No downloads to review',
+    pictures:    'No pictures to review',
     similar:     'No similar shots to review',
-  }[photoDeck];
-  const emptyDeckSubtitle = typeFiltered
+  }[photoDeck] ?? `Nothing to review in ${albumTitle ?? 'this album'}`;
+  // Album decks: explain an empty album instead of a generic message
+  const albumScan = isAlbumDeck(photoDeck) ? scanStats : null;
+  const albumName = albumTitle ?? 'this album';
+  const albumEmpty = albumScan && photos.length === 0 && photosLoaded && !typeFiltered && (
+    albumScan.scanned === 0
+      ? { message: limitedAccess ? `Can't see the photos in ${albumName}` : `No photos in ${albumName}`,
+          subtitle: limitedAccess
+            ? 'Photo access is set to Selected Photos. Allow Full Access in Settings → Privacy → Photos'
+            : 'It may only contain videos' }
+      : albumScan.reviewedSkipped === albumScan.scanned
+        ? { message: `All ${albumScan.scanned} photos in ${albumName} were already reviewed`,
+            subtitle: 'Long-press the storage pill to start over' }
+        : null
+  );
+  const emptyDeckSubtitle = albumEmpty ? albumEmpty.subtitle
+    : typeFiltered
     ? 'Try another file type'
     : reviewedBaseRef.current.photo.size > 0
       ? 'Long-press the storage pill to start over'
       : undefined;
 
   // Review modal also needs trashed assets that aren't in the current deck
-  const trashCache   = [...trashCacheRef.current[mediaMode].values()];
-  const reviewAssets = [
+  const trashCache   = reviewVisible ? [...trashCacheRef.current[mediaMode].values()] : [];
+  const reviewAssets = !reviewVisible ? [] : [
     ...trashCache.map(c => c.asset),
     ...(mediaMode === 'photo' ? photosRef.current : videosRef.current)
       .filter(a => !trashCacheRef.current[mediaMode].has(a.id)),
@@ -1132,7 +1205,7 @@ export default function App() {
         <MediaToggle mode={mediaMode} onChange={handleModeChange} />
         <View style={styles.topBarRow}>
           <StoragePill savedBytes={activeSavedBytes} totalBytes={totalStorageBytes} onLongPress={handleResetProgress} />
-          {mediaMode === 'photo' && <DeckPill deck={photoDeck} type={photoType} onPress={() => setFilterSheetOpen(true)} />}
+          {mediaMode === 'photo' && <DeckPill deck={photoDeck} type={photoType} albumTitle={albumTitle} onPress={() => setFilterSheetOpen(true)} />}
           {mediaMode === 'video' && (
             <TouchableOpacity onPress={toggleMute} activeOpacity={0.7}>
               <BlurView intensity={50} tint="dark" style={styles.muteButton}>
@@ -1156,7 +1229,7 @@ export default function App() {
         {mediaMode === 'photo' && !photosLoaded ? (
           <SplashScreen icon="images-outline" message="Loading photos…" pulse />
         ) : mediaMode === 'photo' && photos.length === 0 ? (
-          <SplashScreen icon="images-outline" message={emptyDeckMessage} subtitle={emptyDeckSubtitle} />
+          <SplashScreen icon="images-outline" message={albumEmpty ? albumEmpty.message : emptyDeckMessage} subtitle={emptyDeckSubtitle} />
         ) : mediaMode === 'video' && !videosLoaded ? (
           <SplashScreen icon="videocam-outline" message="Loading videos…" pulse />
         ) : mediaMode === 'video' && videos.length === 0 ? (
@@ -1293,6 +1366,8 @@ export default function App() {
         deck={photoDeck}
         type={photoType}
         onChange={handleFilterChange}
+        folderAccessLost={folderAccessLost}
+        onFolderPicked={handleFolderPicked}
         onClose={() => setFilterSheetOpen(false)}
       />
 
