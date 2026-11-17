@@ -2,7 +2,7 @@ services:
   expo-swipe-cleaner:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: dockerfile
     ports:
       - "8081:8081"
       - "19000:19000"
@@ -10,4 +10,6 @@ services:
     network_mode: host
     restart: unless-stopped
     environment:
-      - EXPO_TOKEN=ELHkfUzysCmpBD9O51E2A7frudgW778jnW_IbtfW
+      # Set these in Portainer (stack > Environment variables) or a .env file next to this file. Never commit the token.
+      - EXPO_TOKEN=${EXPO_TOKEN:-}
+      - REACT_NATIVE_PACKAGER_HOSTNAME=${PACKAGER_HOSTNAME:-10.156.88.161}

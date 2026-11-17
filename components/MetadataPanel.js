@@ -43,8 +43,8 @@ export const fetchAssetInfo = async (assetId, _uri) => {
     const local = await MediaLibrary.getAssetInfoAsync(assetId, {
       shouldDownloadFromNetwork: false,
     });
-    // Step 2 — allow network (resolves iCloud originals)
-    const remote = await MediaLibrary.getAssetInfoAsync(assetId, {
+    // Step 2 — allow network only if needed (resolves iCloud originals)
+    const remote = local?.localUri ? null : await MediaLibrary.getAssetInfoAsync(assetId, {
       shouldDownloadFromNetwork: true,
     });
 

@@ -6,7 +6,7 @@ import { Image } from 'expo-image';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as MediaLibrary from 'expo-media-library/legacy';
 import { useVideoPlayer, VideoView } from 'expo-video';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, Animated, AppState, PanResponder, StatusBar, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import Swiper from 'react-native-deck-swiper';
 import { GestureHandlerRootView, PinchGestureHandler, State } from 'react-native-gesture-handler';
@@ -14,8 +14,9 @@ import { GestureHandlerRootView, PinchGestureHandler, State } from 'react-native
 // Components & Constants
 import ActionButtons from './components/ActionButtons';
 import MetadataPanel from './components/MetadataPanel';
+import PhotoFilterSheet from './components/PhotoFilterSheet';
 import TrashReviewModal from './components/TrashReviewModal';
-import { clearProgress, loadProgress, PHOTO_DECKS, saveProgress, selectForDeck } from './lib/progress';
+import { clearProgress, loadProgress, PHOTO_DECKS, PHOTO_TYPES, saveProgress, selectForDeck } from './lib/progress';
 import { listenForReminderTaps, refreshReminder } from './lib/reminder';
 import {
   CARD_HEIGHT,
@@ -60,14 +61,19 @@ const StoragePill = ({ savedBytes, totalBytes, onLongPress }) => {
 };
 
 // ─── DeckPill ─────────────────────────────────────────────────────────────────
-// Tap cycles the photo deck: All → Screenshots → Similar
-const DeckPill = ({ deck, onPress }) => {
+// Shows the active photo filters; tap opens the filter sheet
+const DeckPill = ({ deck, type, onPress }) => {
   const current = PHOTO_DECKS.find(d => d.key === deck) ?? PHOTO_DECKS[0];
+  const typeLabel = PHOTO_TYPES.find(t => t.key === type)?.label;
+  const label = type === 'all' ? current.label
+    : deck === 'all' ? typeLabel
+    : `${current.label} · ${typeLabel}`;
   return (
-    <TouchableOpacity onPress={onPress} activeOpacity={0.7}>
+    <TouchableOpacity onPress={onPress} activeOpacity={0.7} accessibilityRole="button" accessibilityLabel={`Photo filters: ${label}`}>
       <BlurView intensity={50} tint="dark" style={styles.storagePill}>
         <Ionicons name={current.icon} size={13} color="rgba(255,255,255,0.75)" />
-        <Text style={styles.storageText}>{current.label}</Text>
+        <Text style={styles.storageText}>{label}</Text>
+        <Ionicons name="chevron-down" size={12} color="rgba(255,255,255,0.75)" />
       </BlurView>
     </TouchableOpacity>
   );
@@ -140,6 +146,26 @@ const CardEntrance = ({ children }) => {
     </Animated.View>
   );
 };
+
+// ─── PhotoCard ────────────────────────────────────────────────────────────────
+// Memoized so unrelated app state doesn't re-render the whole card stack.
+const PhotoCard = memo(({ card }) => (
+  <CardEntrance>
+    <View style={styles.card}>
+      <Image source={{ uri: card.uri }} style={styles.cardImage} contentFit="contain" transition={120} cachePolicy="memory-disk" />
+      {card.labels && (
+        <View style={styles.labelRow} pointerEvents="none">
+          {[card.labels.source, card.labels.duplicate].map(label => (
+            <View key={label} style={styles.labelChip}>
+              <Text style={styles.durationText}>{label}</Text>
+            </View>
+          ))}
+        </View>
+      )}
+    </View>
+  </CardEntrance>
+));
+PhotoCard.displayName = 'PhotoCard';
 
 // ─── MediaToggle ──────────────────────────────────────────────────────────────
 const MediaToggle = ({ mode, onChange }) => {
@@ -290,6 +316,9 @@ export default function App() {
   const progressReadyRef = useRef(false);
   const [photoDeck, setPhotoDeck] = useState('all');
   const photoDeckRef = useRef('all');
+  const [photoType, setPhotoType] = useState('all');
+  const photoTypeRef = useRef('all');
+  const [filterSheetOpen, setFilterSheetOpen] = useState(false);
   const deckGenerationRef = useRef(0);
   const deckScanRef = useRef({ prev: null, prevEmitted: false });
   const countedIdsRef = useRef(new Set());
@@ -299,8 +328,7 @@ export default function App() {
   const hintShownRef = useRef(false);
 
   // ── Pinch-to-zoom (photos) ─────────────────────────────────────────────────
-  const [zoomScale, setZoomScale] = useState(1);
-  const [isZoomed, setIsZoomed] = useState(false);
+  const zoomScaleRef = useRef(1);
   const baseScaleRef = useRef(1);
   const pinchRef = useRef(null);
 
@@ -358,8 +386,9 @@ export default function App() {
   useEffect(() => {
     photosLengthRef.current = photos.length;
     // Merge into photosRef so we always have the full unsliced set for modal lookups
+    const currentIds = new Set(photos.map(p => p.id));
     photosRef.current = [
-      ...photosRef.current.filter(p => !photos.find(q => q.id === p.id)),
+      ...photosRef.current.filter(p => !currentIds.has(p.id)),
       ...photos,
     ];
   }, [photos]);
@@ -609,9 +638,13 @@ export default function App() {
     try {
       const reviewed = getReviewedSet('photo');
       const page = await fetchUnreviewed('photo', cursor,
-        (assets) => selectForDeck(photoDeckRef.current, assets, deckScanRef.current, reviewed), isStale);
+        (assets) => selectForDeck(photoDeckRef.current, assets, deckScanRef.current, reviewed, photoTypeRef.current), isStale);
       if (!page) return;
-      setPhotos(prev => [...prev, ...page.assets]);
+      // An undone photo sits in the deck already and can also turn up in a later page
+      setPhotos(prev => {
+        const present = new Set(prev.map(p => p.id));
+        return [...prev, ...page.assets.filter(a => !present.has(a.id))];
+      });
       setEndCursor(page.endCursor);
       setHasNextPage(page.hasNextPage);
       hasNextPageRef.current = page.hasNextPage;
@@ -684,10 +717,8 @@ export default function App() {
   }, [getReviewedSet]);
 
   const resetOverlays = useCallback(() => {
-    Animated.parallel([
-      Animated.timing(trashOpacity, { toValue: 0, duration: 0, useNativeDriver: true }),
-      Animated.timing(keepOpacity,  { toValue: 0, duration: 0, useNativeDriver: true }),
-    ]).start();
+    trashOpacity.setValue(0);
+    keepOpacity.setValue(0);
   }, [trashOpacity, keepOpacity]);
 
   const handleModeChange = useCallback((m) => {
@@ -718,7 +749,8 @@ export default function App() {
         if (prev.includes(photo.id)) return prev; // guard against double-fire
         return [...prev, photo.id];
       });
-      setSwipeHistory(prev => [...prev, { dir: 'left', assetId: photo.id, fileSize }]);
+      trashCacheRef.current.photo.set(photo.id, { asset: photo, fileSize });
+      setSwipeHistory(prev => [...prev, { dir: 'left', assetId: photo.id, fileSize, asset: photo, generation: deckGenerationRef.current }]);
       setTrashSizeBytes(prev => prev + fileSize);
     } else {
       const video = videosRef.current[swiperIndex + videoTrimOffsetRef.current]
@@ -739,7 +771,7 @@ export default function App() {
     if (mediaModeRef.current === 'photo') {
       setPhotos(currentPhotos => {
         const photo = currentPhotos[swiperIndex];
-        setSwipeHistory(prev => [...prev, { dir: 'right', assetId: photo?.id, fileSize: 0 }]);
+        setSwipeHistory(prev => [...prev, { dir: 'right', assetId: photo?.id, fileSize: 0, asset: photo, generation: deckGenerationRef.current }]);
         return currentPhotos;
       });
     } else {
@@ -810,11 +842,11 @@ export default function App() {
   const handleSwiping = useCallback((x) => {
     const threshold = 40;
     if (x < -threshold) {
-      Animated.timing(trashOpacity, { toValue: Math.min(1, (Math.abs(x) - threshold) / 80), duration: 0, useNativeDriver: true }).start();
-      Animated.timing(keepOpacity,  { toValue: 0, duration: 0, useNativeDriver: true }).start();
+      trashOpacity.setValue(Math.min(1, (Math.abs(x) - threshold) / 80));
+      keepOpacity.setValue(0);
     } else if (x > threshold) {
-      Animated.timing(keepOpacity,  { toValue: Math.min(1, (x - threshold) / 80), duration: 0, useNativeDriver: true }).start();
-      Animated.timing(trashOpacity, { toValue: 0, duration: 0, useNativeDriver: true }).start();
+      keepOpacity.setValue(Math.min(1, (x - threshold) / 80));
+      trashOpacity.setValue(0);
     } else {
       resetOverlays();
     }
@@ -835,14 +867,34 @@ export default function App() {
     const nextIndex = Math.max(0, currentIdx - 1);
 
     if (isPhoto) {
-      setCardIndex(nextIndex);
-      setSwipeHistory(prev => prev.slice(0, -1));
-      if (last.dir === 'left' && last.assetId) {
-        setTimeout(() => {
-          setTrashQueue(q => q.filter(id => id !== last.assetId));
+      const removeFromTrash = () => {
+        if (last.dir !== 'left' || !last.assetId) return;
+        // A rescued photo already left the trash and had its size subtracted
+        if (trashCacheRef.current.photo.delete(last.assetId)) {
           setTrashSizeBytes(prev => Math.max(0, prev - (last.fileSize ?? 0)));
-        }, SWIPE_BACK_MS + 50);
+        }
+        setTrashQueue(q => q.filter(id => id !== last.assetId));
+      };
+
+      setSwipeHistory(prev => prev.slice(0, -1));
+
+      // The swipe happened under another filter, so its card isn't behind the current
+      // one. Put the photo back on top of the deck, even if this filter wouldn't list it.
+      if (last.generation !== deckGenerationRef.current) {
+        removeFromTrash();
+        reviewedBaseRef.current.photo.delete(last.assetId);
+        if (last.asset) {
+          setPhotos(prev => {
+            const at = Math.min(cardIndexRef.current, prev.length);
+            return [...prev.slice(0, at), last.asset, ...prev.slice(at).filter(p => p.id !== last.assetId)];
+          });
+        }
+        undoUnlockTimeoutRef.current = setTimeout(() => { undoInFlightRef.current = false; }, 150);
+        return;
       }
+
+      setCardIndex(nextIndex);
+      setTimeout(removeFromTrash, SWIPE_BACK_MS + 50);
     } else {
       setVideoCardIndex(nextIndex);
       setVideoSwipeHistory(prev => prev.slice(0, -1));
@@ -927,18 +979,22 @@ export default function App() {
   }, [trashQueue, videoTrashQueue]);
 
   // Reload the photo deck from the newest photo; the trash queue is kept.
-  // Undo can't cross a reload, so this session's history is folded in first.
-  const restartPhotoDeck = useCallback((deck) => {
-    stashTrashed('photo');
-    commitHistory('photo');
-    setSwipeHistory([]);
-    swipeHistoryRef.current = [];
+  // Filter changes keep the swipe history so Undo still works across them.
+  const restartPhotoDeck = useCallback((deck, type = photoTypeRef.current, keepHistory = false) => {
+    if (!keepHistory) {
+      stashTrashed('photo');
+      commitHistory('photo');
+      setSwipeHistory([]);
+      swipeHistoryRef.current = [];
+    }
 
     deckGenerationRef.current += 1;
     loadingMoreRef.current = false;
     deckScanRef.current = { prev: null, prevEmitted: false };
     photoDeckRef.current = deck;
     setPhotoDeck(deck);
+    photoTypeRef.current = type;
+    setPhotoType(type);
 
     photosRef.current = [];
     photoTrimOffsetRef.current = 0;
@@ -954,9 +1010,11 @@ export default function App() {
     loadMorePhotos();
   }, [stashTrashed, commitHistory, resetOverlays, loadMorePhotos]);
 
-  const handleDeckCycle = useCallback(() => {
-    const idx = PHOTO_DECKS.findIndex(d => d.key === photoDeckRef.current);
-    restartPhotoDeck(PHOTO_DECKS[(idx + 1) % PHOTO_DECKS.length].key);
+  const handleFilterChange = useCallback((deck, type) => {
+    setFilterSheetOpen(false);
+    // Reloading restarts the deck, so don't do it for an unchanged selection
+    if (deck === photoDeckRef.current && type === photoTypeRef.current) return;
+    restartPhotoDeck(deck, type, true);
   }, [restartPhotoDeck]);
 
   // Long-press the storage pill: forget review progress and start over
@@ -1029,14 +1087,22 @@ export default function App() {
   const activePhoto = activeAssets[activeIndex];
   const allSwiped   = activeIndex >= activeAssets.length && !activeHasNext;
 
-  const emptyDeckMessage = {
+  const typeFiltered = photoType !== 'all';
+  const typeLabel = photoType === 'other' ? 'other file type' : PHOTO_TYPES.find(t => t.key === photoType)?.label;
+  const emptyDeckMessage = typeFiltered ? {
+    all:         `No ${typeLabel} photos to review`,
+    screenshots: `No ${typeLabel} screenshots to review`,
+    similar:     `No similar ${typeLabel} shots to review`,
+  }[photoDeck] : {
     all:         reviewedBaseRef.current.photo.size > 0 ? 'All caught up!' : 'No photos found',
     screenshots: 'No screenshots to review',
     similar:     'No similar shots to review',
   }[photoDeck];
-  const emptyDeckSubtitle = reviewedBaseRef.current.photo.size > 0
-    ? 'Long-press the storage pill to start over'
-    : undefined;
+  const emptyDeckSubtitle = typeFiltered
+    ? 'Try another file type'
+    : reviewedBaseRef.current.photo.size > 0
+      ? 'Long-press the storage pill to start over'
+      : undefined;
 
   // Review modal also needs trashed assets that aren't in the current deck
   const trashCache   = [...trashCacheRef.current[mediaMode].values()];
@@ -1066,7 +1132,7 @@ export default function App() {
         <MediaToggle mode={mediaMode} onChange={handleModeChange} />
         <View style={styles.topBarRow}>
           <StoragePill savedBytes={activeSavedBytes} totalBytes={totalStorageBytes} onLongPress={handleResetProgress} />
-          {mediaMode === 'photo' && <DeckPill deck={photoDeck} onPress={handleDeckCycle} />}
+          {mediaMode === 'photo' && <DeckPill deck={photoDeck} type={photoType} onPress={() => setFilterSheetOpen(true)} />}
           {mediaMode === 'video' && (
             <TouchableOpacity onPress={toggleMute} activeOpacity={0.7}>
               <BlurView intensity={50} tint="dark" style={styles.muteButton}>
@@ -1098,7 +1164,7 @@ export default function App() {
             ? <SplashScreen icon="checkmark-circle" message="All caught up!" subtitle="Long-press the storage pill to start over" />
             : <SplashScreen icon="videocam-outline" message="No videos found" />
         ) : allSwiped ? (
-          <SplashScreen icon="checkmark-circle" message="All caught up!" subtitle="Nothing left to review" />
+          <SplashScreen icon="checkmark-circle" message="All caught up!" subtitle={mediaMode === 'photo' && typeFiltered ? 'Try another file type' : 'Nothing left to review'} />
         ) : (
           <Animated.View style={{ width: SCREEN_WIDTH, height: CARD_HEIGHT, alignItems: 'center', justifyContent: 'center', transform: [{ translateX: hintAnim }] }}>
           <Swiper
@@ -1106,6 +1172,7 @@ export default function App() {
             ref={swiperRef}
             cards={activeAssets}
             cardIndex={activeIndex}
+            keyExtractor={(card) => card.id}
             infinite={false}
             renderCard={(card, cardIdx) => {
               if (!card) return null;
@@ -1129,22 +1196,7 @@ export default function App() {
                   </CardEntrance>
                 );
               }
-              return (
-                <CardEntrance>
-                  <View style={styles.card}>
-                    <Image source={{ uri: card.uri }} style={styles.cardImage} contentFit="contain" transition={220} />
-                    {card.labels && (
-                      <View style={styles.labelRow} pointerEvents="none">
-                        {[card.labels.source, card.labels.duplicate].map(label => (
-                          <BlurView key={label} intensity={52} tint="dark" style={styles.labelChip}>
-                            <Text style={styles.durationText}>{label}</Text>
-                          </BlurView>
-                        ))}
-                      </View>
-                    )}
-                  </View>
-                </CardEntrance>
-              );
+              return <PhotoCard card={card} />;
             }}
             onSwiped={handleSwiped}
             onSwipedLeft={handleSwipeLeft}
@@ -1171,24 +1223,17 @@ export default function App() {
           <PinchGestureHandler
             ref={pinchRef}
             onGestureEvent={(e) => {
-              const s = Math.max(1, Math.min(4, baseScaleRef.current * e.nativeEvent.scale));
-              setZoomScale(s);
-              setIsZoomed(s > 1.05);
+              zoomScaleRef.current = Math.max(1, Math.min(4, baseScaleRef.current * e.nativeEvent.scale));
             }}
             onHandlerStateChange={(e) => {
               if (e.nativeEvent.state === State.END || e.nativeEvent.state === State.CANCELLED) {
-                if (zoomScale < 1.15) {
-                  baseScaleRef.current = 1;
-                  setZoomScale(1);
-                  setIsZoomed(false);
-                } else {
-                  baseScaleRef.current = zoomScale;
-                }
+                baseScaleRef.current = zoomScaleRef.current < 1.15 ? 1 : zoomScaleRef.current;
+                zoomScaleRef.current = baseScaleRef.current;
               }
             }}
           >
             <Animated.View
-              style={[styles.cardOverlay, { transform: [{ scale: zoomScale }] }]}
+              style={styles.cardOverlay}
               pointerEvents="box-none"
             />
           </PinchGestureHandler>
@@ -1241,6 +1286,14 @@ export default function App() {
         onTrash={handleEmptyTrash}
         undoDisabled={activeHistory.length === 0}
         trashCount={activeTrashQ.length}
+      />
+
+      <PhotoFilterSheet
+        visible={filterSheetOpen}
+        deck={photoDeck}
+        type={photoType}
+        onChange={handleFilterChange}
+        onClose={() => setFilterSheetOpen(false)}
       />
 
       {/* Modal */}
@@ -1314,8 +1367,9 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: 'rgba(255,255,255,0.13)',
   },
-  labelRow: { position: 'absolute', top: 14, left: 14, flexDirection: 'row', gap: 6 },
+  labelRow: { position: 'absolute', bottom: 14, right: 14, left: 14, flexDirection: 'row', justifyContent: 'flex-end', flexWrap: 'wrap', gap: 6 },
   labelChip: {
+    backgroundColor: 'rgba(20,20,20,0.6)',
     borderRadius: 12,
     paddingHorizontal: 10, paddingVertical: 5,
     overflow: 'hidden',

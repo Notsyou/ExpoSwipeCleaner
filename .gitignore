@@ -42,3 +42,6 @@ app-example
 /ios
 /android
 ExpoSwipeCleaner/
+
+# Expo token for docker compose
+.env
