@@ -6,7 +6,7 @@ import { Image } from 'expo-image';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as MediaLibrary from 'expo-media-library/legacy';
 import { useVideoPlayer, VideoView } from 'expo-video';
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { createRef, memo, useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, Animated, AppState, PanResponder, StatusBar, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import Swiper from 'react-native-deck-swiper';
 import { GestureHandlerRootView, PinchGestureHandler, State } from 'react-native-gesture-handler';
@@ -16,6 +16,8 @@ import ActionButtons from './components/ActionButtons';
 import MetadataPanel from './components/MetadataPanel';
 import PhotoFilterSheet from './components/PhotoFilterSheet';
 import TrashReviewModal from './components/TrashReviewModal';
+import Tutorial from './components/Tutorial';
+import { hasSeenTutorial, markTutorialSeen } from './lib/tutorial';
 import { clearProgress, isScreenshot, loadProgress, needsExif, PHOTO_DECKS, PHOTO_TYPES, saveProgress, selectForDeck } from './lib/progress';
 import {
   albumIdOf, deleteFileAssets, enrichWithExif, fileAssetFromId, getSavedFolder, getScreenshotsAlbum,
@@ -45,7 +47,7 @@ const formatDuration = (secs) => {
 };
 
 // ─── StoragePill ──────────────────────────────────────────────────────────────
-const StoragePill = ({ savedBytes, totalBytes, onLongPress }) => {
+const StoragePill = ({ savedBytes, totalBytes, onLongPress, targetRef }) => {
   const hasSaved = savedBytes > 0;
   const hasTotal = totalBytes > 0;
   if (!hasSaved && !hasTotal) return null;
@@ -53,7 +55,7 @@ const StoragePill = ({ savedBytes, totalBytes, onLongPress }) => {
     ? (b / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
     : (b / (1024 * 1024)).toFixed(0) + ' MB';
   return (
-    <TouchableOpacity onLongPress={onLongPress} activeOpacity={0.8} delayLongPress={600}>
+    <TouchableOpacity ref={targetRef} onLongPress={onLongPress} activeOpacity={0.8} delayLongPress={600}>
       <BlurView intensity={50} tint="dark" style={styles.storagePill}>
         <Ionicons name="cloud-done-outline" size={13} color="rgba(255,255,255,0.55)" />
         {hasSaved && <Text style={styles.storageText}>{toGB(savedBytes)} saved</Text>}
@@ -66,7 +68,7 @@ const StoragePill = ({ savedBytes, totalBytes, onLongPress }) => {
 
 // ─── DeckPill ─────────────────────────────────────────────────────────────────
 // Shows the active photo filters; tap opens the filter sheet
-const DeckPill = ({ deck, type, albumTitle, onPress }) => {
+const DeckPill = ({ deck, type, albumTitle, onPress, targetRef }) => {
   const current = isAlbumDeck(deck)
     ? { key: deck, label: albumTitle ?? 'Album', icon: 'folder-outline' }
     : PHOTO_DECKS.find(d => d.key === deck) ?? PHOTO_DECKS[0];
@@ -75,7 +77,7 @@ const DeckPill = ({ deck, type, albumTitle, onPress }) => {
     : deck === 'all' ? typeLabel
     : `${current.label} · ${typeLabel}`;
   return (
-    <TouchableOpacity onPress={onPress} activeOpacity={0.7} accessibilityRole="button" accessibilityLabel={`Photo filters: ${label}`}>
+    <TouchableOpacity ref={targetRef} onPress={onPress} activeOpacity={0.7} accessibilityRole="button" accessibilityLabel={`Photo filters: ${label}`}>
       <BlurView intensity={50} tint="dark" style={styles.storagePill}>
         <Ionicons name={current.icon} size={13} color="rgba(255,255,255,0.75)" />
         <Text style={styles.storageText}>{label}</Text>
@@ -357,6 +359,27 @@ export default function App() {
 
   // ── Empty-state flags ──────────────────────────────────────────────────────
   const [photosLoaded, setPhotosLoaded] = useState(false);
+
+  // ── Tutorial ───────────────────────────────────────────────────────────────
+  const [tutorialVisible, setTutorialVisible] = useState(false);
+  const [tutorialTargets] = useState(() => Object.fromEntries(
+    ['deck', 'mediaToggle', 'deckPill', 'storagePill', 'undo', 'review', 'trash', 'help'].map((k) => [k, createRef()]),
+  ));
+  const closeTutorial = useCallback(() => {
+    setTutorialVisible(false);
+    markTutorialSeen();
+  }, []);
+  // First launch: show once the deck is up (after the top bar's entrance animation)
+  const tutorialCheckedRef = useRef(false);
+  useEffect(() => {
+    if (!photosLoaded || tutorialCheckedRef.current) return;
+    tutorialCheckedRef.current = true;
+    let timer;
+    hasSeenTutorial().then((seen) => {
+      if (!seen) timer = setTimeout(() => setTutorialVisible(true), 900);
+    });
+    return () => clearTimeout(timer);
+  }, [photosLoaded]);
   const [videosLoaded, setVideosLoaded] = useState(false);
 
   const swiperRef = useRef(null);
@@ -1202,10 +1225,12 @@ export default function App() {
         }]}
         pointerEvents="box-none"
       >
-        <MediaToggle mode={mediaMode} onChange={handleModeChange} />
+        <View ref={tutorialTargets.mediaToggle} collapsable={false}>
+          <MediaToggle mode={mediaMode} onChange={handleModeChange} />
+        </View>
         <View style={styles.topBarRow}>
-          <StoragePill savedBytes={activeSavedBytes} totalBytes={totalStorageBytes} onLongPress={handleResetProgress} />
-          {mediaMode === 'photo' && <DeckPill deck={photoDeck} type={photoType} albumTitle={albumTitle} onPress={() => setFilterSheetOpen(true)} />}
+          <StoragePill savedBytes={activeSavedBytes} totalBytes={totalStorageBytes} onLongPress={handleResetProgress} targetRef={tutorialTargets.storagePill} />
+          {mediaMode === 'photo' && <DeckPill deck={photoDeck} type={photoType} albumTitle={albumTitle} onPress={() => setFilterSheetOpen(true)} targetRef={tutorialTargets.deckPill} />}
           {mediaMode === 'video' && (
             <TouchableOpacity onPress={toggleMute} activeOpacity={0.7}>
               <BlurView intensity={50} tint="dark" style={styles.muteButton}>
@@ -1217,6 +1242,17 @@ export default function App() {
               </BlurView>
             </TouchableOpacity>
           )}
+          <TouchableOpacity
+            ref={tutorialTargets.help}
+            onPress={() => setTutorialVisible(true)}
+            activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel="How to use Swipe Cleaner"
+          >
+            <BlurView intensity={50} tint="dark" style={styles.helpButton}>
+              <Ionicons name="help" size={17} color="rgba(255,255,255,0.85)" />
+            </BlurView>
+          </TouchableOpacity>
         </View>
       </Animated.View>
 
@@ -1225,7 +1261,7 @@ export default function App() {
       <EdgeVignette side="right" color="rgba(48,209,88,0.72)"  opacity={keepOpacity}  />
 
       {/* Deck Area */}
-      <View style={styles.deckArea} pointerEvents="box-none">
+      <View ref={tutorialTargets.deck} collapsable={false} style={styles.deckArea} pointerEvents="box-none">
         {mediaMode === 'photo' && !photosLoaded ? (
           <SplashScreen icon="images-outline" message="Loading photos…" pulse />
         ) : mediaMode === 'photo' && photos.length === 0 ? (
@@ -1359,7 +1395,10 @@ export default function App() {
         onTrash={handleEmptyTrash}
         undoDisabled={activeHistory.length === 0}
         trashCount={activeTrashQ.length}
+        targetRefs={tutorialTargets}
       />
+
+      {tutorialVisible && <Tutorial targets={tutorialTargets} onDone={closeTutorial} />}
 
       <PhotoFilterSheet
         visible={filterSheetOpen}
@@ -1431,6 +1470,7 @@ const styles = StyleSheet.create({
   doneText: { color: 'rgba(255,255,255,0.4)', fontSize: 18, fontWeight: '500' },
 
   topBarRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  helpButton: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', overflow: 'hidden', ...GLASS_BORDER },
   muteButton: { width: 34, height: 34, borderRadius: 17, alignItems: 'center', justifyContent: 'center', overflow: 'hidden', ...GLASS_BORDER },
 
   durationBadge: {

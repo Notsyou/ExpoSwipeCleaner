@@ -7,7 +7,7 @@ import { BlurView } from 'expo-blur';
 import { Ionicons } from '@expo/vector-icons';
 import { SAFE_BOTTOM, GLASS_BORDER, Z } from '../constants';
 
-const ActionButton = ({ icon, label, onPress, badge, danger, disabled }) => {
+const ActionButton = ({ icon, label, onPress, badge, danger, disabled, targetRef }) => {
   const scale = useRef(new Animated.Value(1)).current;
 
   const handlePressIn = () => {
@@ -38,7 +38,7 @@ const ActionButton = ({ icon, label, onPress, badge, danger, disabled }) => {
       disabled={disabled}
       hitSlop={{ top: 10, bottom: 10, left: 8, right: 8 }}
     >
-      <Animated.View style={[styles.iconWrap, { transform: [{ scale }] }]}>
+      <Animated.View ref={targetRef} collapsable={false} style={[styles.iconWrap, { transform: [{ scale }] }]}>
         <BlurView intensity={40} tint="dark" style={[styles.iconBg, danger && styles.iconBgDanger]}>
           <Ionicons name={icon} size={22} color={danger ? '#FF6B6B' : 'rgba(255,255,255,0.9)'} />
         </BlurView>
@@ -53,7 +53,7 @@ const ActionButton = ({ icon, label, onPress, badge, danger, disabled }) => {
   );
 };
 
-export default function ActionButtons({ onUndo, onReview, onTrash, undoDisabled, trashCount }) {
+export default function ActionButtons({ onUndo, onReview, onTrash, undoDisabled, trashCount, targetRefs = {} }) {
   return (
     <View style={styles.wrapper} pointerEvents="box-none">
       <BlurView intensity={60} tint="dark" style={styles.bar}>
@@ -61,12 +61,14 @@ export default function ActionButtons({ onUndo, onReview, onTrash, undoDisabled,
           icon="arrow-undo-outline"
           label="Undo"
           onPress={onUndo}
+          targetRef={targetRefs.undo}
           disabled={undoDisabled}
         />
         <ActionButton
           icon="albums-outline"
           label="Review"
           onPress={onReview}
+          targetRef={targetRefs.review}
         />
         <ActionButton
           icon="trash-outline"
@@ -74,6 +76,7 @@ export default function ActionButtons({ onUndo, onReview, onTrash, undoDisabled,
           badge={trashCount > 0 ? trashCount : null}
           danger
           onPress={onTrash}
+          targetRef={targetRefs.trash}
           disabled={trashCount === 0}
         />
       </BlurView>
