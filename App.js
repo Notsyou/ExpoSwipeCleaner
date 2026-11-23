@@ -48,9 +48,9 @@ const formatDuration = (secs) => {
 
 // ─── StoragePill ──────────────────────────────────────────────────────────────
 const StoragePill = ({ savedBytes, totalBytes, onLongPress, targetRef }) => {
-  const hasSaved = savedBytes > 0;
+  // Always rendered: it's also the long-press target for "start over".
+  // Expo Go never reports library file sizes, so the total is often 0 — hide just that part.
   const hasTotal = totalBytes > 0;
-  if (!hasSaved && !hasTotal) return null;
   const toGB = (b) => b >= 1024 * 1024 * 1024
     ? (b / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
     : (b / (1024 * 1024)).toFixed(0) + ' MB';
@@ -66,8 +66,8 @@ const StoragePill = ({ savedBytes, totalBytes, onLongPress, targetRef }) => {
     >
       <BlurView intensity={50} tint="dark" style={styles.storagePill}>
         <Ionicons name="cloud-done-outline" size={13} color="rgba(255,255,255,0.55)" />
-        {hasSaved && <Text style={styles.storageText}>{toGB(savedBytes)} saved</Text>}
-        {hasSaved && hasTotal && <Text style={styles.storageTextDim}>·</Text>}
+        <Text style={styles.storageText}>{savedBytes > 0 ? `${toGB(savedBytes)} saved` : 'Nothing in trash'}</Text>
+        {hasTotal && <Text style={styles.storageTextDim}>·</Text>}
         {hasTotal && <Text style={styles.storageTextDim}>{toGB(totalBytes)} total</Text>}
       </BlurView>
     </Pressable>
