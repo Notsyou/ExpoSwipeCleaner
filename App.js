@@ -7,7 +7,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 import * as MediaLibrary from 'expo-media-library/legacy';
 import { useVideoPlayer, VideoView } from 'expo-video';
 import { createRef, memo, useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Animated, AppState, PanResponder, StatusBar, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { Alert, Animated, AppState, PanResponder, Pressable, StatusBar, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import Swiper from 'react-native-deck-swiper';
 import { GestureHandlerRootView, PinchGestureHandler, State } from 'react-native-gesture-handler';
 
@@ -18,7 +18,7 @@ import PhotoFilterSheet from './components/PhotoFilterSheet';
 import TrashReviewModal from './components/TrashReviewModal';
 import Tutorial from './components/Tutorial';
 import { hasSeenTutorial, markTutorialSeen } from './lib/tutorial';
-import { clearProgress, isScreenshot, loadProgress, needsExif, PHOTO_DECKS, PHOTO_TYPES, saveProgress, selectForDeck } from './lib/progress';
+import { isScreenshot, loadProgress, needsExif, PHOTO_DECKS, PHOTO_TYPES, saveProgress, selectForDeck } from './lib/progress';
 import {
   albumIdOf, deleteFileAssets, enrichWithExif, fileAssetFromId, getSavedFolder, getScreenshotsAlbum,
   IS_IOS, isAlbumDeck, isFileAsset, listFolderImages,
@@ -55,14 +55,22 @@ const StoragePill = ({ savedBytes, totalBytes, onLongPress, targetRef }) => {
     ? (b / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
     : (b / (1024 * 1024)).toFixed(0) + ' MB';
   return (
-    <TouchableOpacity ref={targetRef} onLongPress={onLongPress} activeOpacity={0.8} delayLongPress={600}>
+    <Pressable
+      ref={targetRef}
+      onLongPress={onLongPress}
+      delayLongPress={500}
+      hitSlop={8}
+      style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
+      accessibilityRole="button"
+      accessibilityHint="Long-press to start over this deck"
+    >
       <BlurView intensity={50} tint="dark" style={styles.storagePill}>
         <Ionicons name="cloud-done-outline" size={13} color="rgba(255,255,255,0.55)" />
         {hasSaved && <Text style={styles.storageText}>{toGB(savedBytes)} saved</Text>}
         {hasSaved && hasTotal && <Text style={styles.storageTextDim}>·</Text>}
         {hasTotal && <Text style={styles.storageTextDim}>{toGB(totalBytes)} total</Text>}
       </BlurView>
-    </TouchableOpacity>
+    </Pressable>
   );
 };
 
@@ -359,6 +367,9 @@ export default function App() {
 
   // ── Empty-state flags ──────────────────────────────────────────────────────
   const [photosLoaded, setPhotosLoaded] = useState(false);
+
+  const [resetting, setResetting] = useState(false);
+  const [progressBump, setProgressBump] = useState(0); // forces a save after a reset
 
   // ── Tutorial ───────────────────────────────────────────────────────────────
   const [tutorialVisible, setTutorialVisible] = useState(false);
@@ -778,7 +789,7 @@ export default function App() {
       });
     }, 400);
     return () => clearTimeout(timer);
-  }, [trashQueue, videoTrashQueue, swipeHistory, videoSwipeHistory, getReviewedSet]);
+  }, [trashQueue, videoTrashQueue, swipeHistory, videoSwipeHistory, getReviewedSet, progressBump]);
 
   // Folds this session's swipes into the persisted base so clearing history
   // (empty trash, deck switch) doesn't make reviewed assets reappear.
@@ -1090,19 +1101,74 @@ export default function App() {
   }, [restartPhotoDeck]);
 
   // Long-press the storage pill: forget review progress and start over
+  // Scans the whole library for photos in this deck that were already reviewed,
+  // so "start over" only brings back this deck. Trashed photos stay out.
+  const collectDeckReviewed = useCallback(async (deck, type, trashIds) => {
+    const reviewed = getReviewedSet('photo');
+    const exclude = new Set(trashIds);
+    const scan = { prev: null, prevEmitted: false };
+    const ids = [];
+    const take = (assets) => {
+      for (const a of selectForDeck(deck, assets, scan, exclude, type)) if (reviewed.has(a.id)) ids.push(a.id);
+    };
+    let album = albumIdOf(deck);
+    if (!album && deck === 'screenshots') album = (await getScreenshotsAlbum())?.id ?? null;
+    let after = null;
+    let hasNext = true;
+    while (hasNext) {
+      const media = await MediaLibrary.getAssetsAsync({
+        first: 200, mediaType: 'photo', album: album ?? undefined,
+        sortBy: [[MediaLibrary.SortBy.creationTime, false]], after: after ?? undefined,
+      });
+      // Camera/Downloads need EXIF to tell sources apart; only reviewed ones matter here
+      if (needsExif(deck)) await enrichWithExif(media.assets.filter(a => reviewed.has(a.id) && !isScreenshot(a)));
+      take(media.assets);
+      after = media.endCursor;
+      hasNext = media.hasNextPage;
+    }
+    if (IS_IOS && deck === 'downloads') {
+      try {
+        const folder = await getSavedFolder();
+        if (folder) take(listFolderImages(folder));
+      } catch {}
+    }
+    return ids;
+  }, [getReviewedSet]);
+
   const handleResetProgress = useCallback(() => {
-    Alert.alert('Start over?', 'Photos and videos you already reviewed will show up again. Your trash queue is kept.', [
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    const isPhoto = mediaModeRef.current === 'photo';
+    const deck = photoDeckRef.current;
+    const deckName = !isPhoto ? 'videos'
+      : isAlbumDeck(deck) ? (albumTitle ?? 'this album')
+      : deck === 'all' ? 'all photos'
+      : (PHOTO_DECKS.find(d => d.key === deck)?.label ?? 'this deck');
+    Alert.alert(`Start over ${deckName}?`, `Everything you already sorted in ${deckName} will show up again. Other decks stay done, and your trash is kept.`, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Start over', style: 'destructive', onPress: async () => {
-          await clearProgress();
-          stashTrashed('photo');
+          if (isPhoto) {
+            setResetting(true);
+            try {
+              stashTrashed('photo');
+              commitHistory('photo');
+              const ids = await collectDeckReviewed(deck, photoTypeRef.current, trashQueue);
+              for (const id of ids) reviewedBaseRef.current.photo.delete(id);
+              swipeHistoryRef.current = [];
+              setSwipeHistory([]);
+              setProgressBump(n => n + 1);
+              restartPhotoDeck(deck);
+            } catch {
+              Alert.alert('Couldn\'t start over', 'Something went wrong reading your library. Try again.');
+            } finally {
+              setResetting(false);
+            }
+            return;
+          }
           stashTrashed('video');
-          // Trashed items stay out of the decks until they're deleted or rescued
-          reviewedBaseRef.current = { photo: new Set(trashQueue), video: new Set(videoTrashQueue) };
-          swipeHistoryRef.current = [];
+          reviewedBaseRef.current.video = new Set(videoTrashQueue);
           videoSwipeHistoryRef.current = [];
           setVideoSwipeHistory([]);
-          restartPhotoDeck(photoDeckRef.current);
+          setProgressBump(n => n + 1);
 
           activePlayerRef.current?.pause();
           videosRef.current = [];
@@ -1118,7 +1184,7 @@ export default function App() {
         },
       },
     ]);
-  }, [trashQueue, videoTrashQueue, stashTrashed, restartPhotoDeck, loadMoreVideos]);
+  }, [albumTitle, trashQueue, videoTrashQueue, stashTrashed, commitHistory, collectDeckReviewed, restartPhotoDeck, loadMoreVideos]);
 
   const handleEmptyTrash = useCallback(() => {
     const isPhoto = mediaModeRef.current === 'photo';
@@ -1190,14 +1256,14 @@ export default function App() {
             : 'It may only contain videos' }
       : albumScan.reviewedSkipped === albumScan.scanned
         ? { message: `All ${albumScan.scanned} photos in ${albumName} were already reviewed`,
-            subtitle: 'Long-press the storage pill to start over' }
+            subtitle: 'Long-press the storage pill to start over this deck' }
         : null
   );
   const emptyDeckSubtitle = albumEmpty ? albumEmpty.subtitle
     : typeFiltered
     ? 'Try another file type'
     : reviewedBaseRef.current.photo.size > 0
-      ? 'Long-press the storage pill to start over'
+      ? 'Long-press the storage pill to start over this deck'
       : undefined;
 
   // Review modal also needs trashed assets that aren't in the current deck
@@ -1262,7 +1328,9 @@ export default function App() {
 
       {/* Deck Area */}
       <View ref={tutorialTargets.deck} collapsable={false} style={styles.deckArea} pointerEvents="box-none">
-        {mediaMode === 'photo' && !photosLoaded ? (
+        {resetting ? (
+          <SplashScreen icon="refresh" message="Finding photos to bring back…" pulse />
+        ) : mediaMode === 'photo' && !photosLoaded ? (
           <SplashScreen icon="images-outline" message="Loading photos…" pulse />
         ) : mediaMode === 'photo' && photos.length === 0 ? (
           <SplashScreen icon="images-outline" message={albumEmpty ? albumEmpty.message : emptyDeckMessage} subtitle={emptyDeckSubtitle} />
