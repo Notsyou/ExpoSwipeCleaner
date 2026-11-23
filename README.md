@@ -9,9 +9,11 @@ Built with [Expo](https://expo.dev) (SDK 58, React Native 0.88).
 - **Photos & Videos modes:** toggle at the top. Videos autoplay muted, with tap-to-pause, a scrub bar and a mute button.
 - **Trash review:** nothing is deleted until you open the review sheet and confirm. You can rescue items from there.
 - **Undo:** step back through your last swipes.
-- **Saved progress:** items you've already kept or trashed don't come back next time you open the app, and the trash queue survives restarts. Long-press the storage pill to start over.
+- **Saved progress:** items you've already kept or trashed don't come back next time you open the app, and the trash queue survives restarts. Long-press the storage pill to start over the current deck.
+- **Tutorial:** shown on first launch; the **?** button replays it.
 - **Photo filters:** tap the filter pill at the top to choose:
-  - **Show:** All, Camera, Screenshots, Downloads, Pictures (Android only), or Similar (burst-style shots taken within 3 seconds of each other)
+  - **Show:** All, Camera, Screenshots, Downloads, Pictures (Android only), or Similar (near-duplicates found by the on-device model, plus burst shots taken within 3 seconds of each other)
+  - **Order:** Newest first, or Largest first (by measured file size)
   - **File type:** All, JPEG, PNG, HEIC/HEIF, or Other
   - **Albums:** any album with photos in it (WhatsApp, Instagram, …). On Android these are your folders.
   - **Files app folder (iOS, development build only):** pick a folder once, e.g. Downloads, and its images show up under Downloads.
@@ -27,6 +29,41 @@ Built with [Expo](https://expo.dev) (SDK 58, React Native 0.88).
   Undo and the trash review keep working when you switch filters partway through.
 - **Source labels:** chips at the bottom right of each photo show where it came from (screenshot / camera / download / pictures / other) and whether it has a duplicate.
 - **Metadata panel:** file size, resolution and date for the current item.
+- **On-device analysis:** while the app is open it measures every file's size and runs a MobileNetV3-Small model on each photo (classifier + near-duplicate search). Nothing is uploaded. See [On-device ML and storage advisory](#on-device-ml-and-storage-advisory).
+- **Smart tips (launch banner):** when the library has lots of screenshots, repeat shots or big files, a tip appears when you open the app. A 24-hour reminder notification covers days you don't open it.
+- **Stats sheet:** tap the storage pill for space freed per day (7/30 days), analysis progress, study mode and CSV export.
+
+---
+
+## On-device ML and storage advisory
+
+Expo Go can't load native ML libraries, so the model runs in a hidden WebView with [onnxruntime-web](https://onnxruntime.ai) (WebAssembly). Everything stays on the phone.
+
+| Piece | Where | What it does |
+|---|---|---|
+| Model | `assets/ml/mobilenet_v3_small_576_int8.onnx` | MobileNetV3-Small (ImageNet weights), conv weights int8 per-channel, 1.05 MB. Outputs the 576-d embedding used in the research notebook. |
+| Classifier | `assets/ml/mlp_weights.json` | The notebook's MLP (camera_photo / downloaded / screenshot) plus the near-duplicate threshold. |
+| Runtime | `assets/ml/ort-wasm-simd-threaded.wasm`, `vendor/onnxruntime-web/` | onnxruntime-web 1.31.1 (MIT). |
+| WebView page | `scripts/embedder-page.js` → `lib/ml/embedderHtml.js` | Decodes the 224×224 JPEG, runs the model and the MLP. Rebuild with `node scripts/build-embedder.mjs`. |
+| Bridge | `lib/ml/embedder.js`, `components/EmbedderHost.js` | Sends the runtime and model into the WebView once per launch, then one photo at a time. |
+| Index | `lib/db.js`, `lib/indexer.js` | SQLite table of every asset: measured size, class, embedding, near-duplicate cluster. Resumes across sessions and pauses while you swipe. |
+| Summary | `lib/summary.js` | Screenshot share, duplicate redundancy, largest files, recoverable bytes, freed trend. Cached for the next launch. |
+| Decision engine | `lib/advisor.js` | JITAI-style rules (all thresholds in `RULES`) decide whether to show the banner. |
+| Logs | `lib/events.js`, `lib/freedLog.js` | Event log (sessions, banner shown/suppressed/acted/dismissed/ignored, reminders, bytes freed, sort use) and the date-indexed freed-storage log. |
+| Study mode | `lib/study.js` | Advisory on / baseline off / alternate daily (ABAB). Set it in the Stats sheet. |
+
+The model files come from `scripts/05_export_mobile_model.py` in the research repo. The pipeline was checked against Python: the int8 model gives the same predictions as the fp32 one on all 332 primary images (same test metrics), and the WebView output matches Python to 4 decimals.
+
+**Launch decision rules** (`lib/advisor.js`), checked in order. The first rule that fails suppresses the banner and logs why:
+
+1. Baseline day (study mode) → no banner.
+2. Fewer than 50 photos analysed → not enough data.
+3. A banner was shown less than 20 h ago.
+4. Cooldown after dismissals: 24 h × 2^(k−1) after k dismissals/ignores in a row, capped at 7 days. Acting on a banner resets it.
+5. The trash was emptied less than 12 h ago.
+6. The strongest of three pressures must be ≥ 1: screenshots ≥ 15% of photo storage (with ≥ 10 to review), ≥ 10 redundant near-duplicates, or the 25 largest photos using ≥ 200 MB.
+
+Each banner type has three phrasings (numbers-first, benefit-first, short), picked at random and logged.
 
 ---
 
@@ -306,10 +343,25 @@ Apps pick the update up the next time they launch. Changing native code (new nat
 App.js                     main screen: decks, swiping, video player, trash flow
 lib/progress.js            saved progress (AsyncStorage) and smart-deck filters
 lib/sources.js             iOS screenshots album, EXIF camera check, albums, Files-app folder
+lib/ml/                    on-device model bridge + generated WebView page
+lib/db.js, lib/indexer.js  SQLite library index and incremental analysis
+lib/summary.js             storage-composition summary (cached for launch)
+lib/advisor.js             launch decision engine + banner phrasings
+lib/events.js              study event log + CSV export
+lib/freedLog.js            date-indexed freed-storage log
+lib/study.js               study mode (on / off / alternate daily)
+lib/reminder.js            24-hour reminder notification
+lib/tutorial.js            tutorial steps
+assets/ml/                 model, classifier weights, WebAssembly runtime
+vendor/onnxruntime-web/    onnxruntime-web ESM bundle (MIT)
 components/
   ActionButtons.js         undo / review / empty-trash buttons
   MetadataPanel.js         size, resolution and date of the current item
-  PhotoFilterSheet.js      filter sheet: decks, file types, albums, Files folder
+  PhotoFilterSheet.js      filter sheet: decks, file types, order, albums, Files folder
+  AdvisoryBanner.js        launch tip card
+  StatsSheet.js            freed-storage chart, analysis progress, study mode, export
+  EmbedderHost.js          hidden WebView that runs the model
+  Tutorial.js              coach-mark tutorial
   TrashReviewModal.js      review & rescue queued items
 constants.js               layout sizes, paging limits, formatters
 patches/                   patch-package fixes for third-party libraries

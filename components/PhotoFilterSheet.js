@@ -35,7 +35,12 @@ const ChipGroup = ({ title, options, selected, onSelect }) => (
 
 // Choosing an option applies it and closes the sheet. The X, a tap outside the
 // sheet and the Android back button close it without changing anything.
-export default function PhotoFilterSheet({ visible, deck, type, onChange, onClose, folderAccessLost, onFolderPicked }) {
+const SORTS = [
+  { key: 'newest', label: 'Newest first' },
+  { key: 'largest', label: 'Largest first' },
+];
+
+export default function PhotoFilterSheet({ visible, deck, type, sort = 'newest', onChange, onClose, folderAccessLost, onFolderPicked }) {
   const [albums, setAlbums] = useState([]);
   const [folderName, setFolderName] = useState(null);
 
@@ -92,6 +97,9 @@ export default function PhotoFilterSheet({ visible, deck, type, onChange, onClos
           </TouchableOpacity>
           <ChipGroup title="Show" options={PHOTO_DECKS} selected={deck} onSelect={key => onChange(key, type)} />
           <ChipGroup title="File type" options={PHOTO_TYPES} selected={type} onSelect={key => onChange(deck, key)} />
+          {deck !== 'similar' && (
+            <ChipGroup title="Order" options={SORTS} selected={sort} onSelect={key => onChange(deck, type, undefined, key)} />
+          )}
           {albums.length > 0 && (
             <ScrollView style={styles.albumScroll} nestedScrollEnabled>
               <ChipGroup

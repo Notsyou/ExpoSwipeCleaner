@@ -13,12 +13,22 @@ import { GestureHandlerRootView, PinchGestureHandler, State } from 'react-native
 
 // Components & Constants
 import ActionButtons from './components/ActionButtons';
-import MetadataPanel from './components/MetadataPanel';
+import MetadataPanel, { fetchAssetInfo } from './components/MetadataPanel';
 import PhotoFilterSheet from './components/PhotoFilterSheet';
 import TrashReviewModal from './components/TrashReviewModal';
 import Tutorial from './components/Tutorial';
 import { hasSeenTutorial, markTutorialSeen } from './lib/tutorial';
-import { isScreenshot, loadProgress, needsExif, PHOTO_DECKS, PHOTO_TYPES, saveProgress, selectForDeck } from './lib/progress';
+import AdvisoryBanner from './components/AdvisoryBanner';
+import EmbedderHost from './components/EmbedderHost';
+import StatsSheet from './components/StatsSheet';
+import { decide, loadAdvisorState, recordActed, recordDismissed, recordShown, RULES as ADVISOR_RULES } from './lib/advisor';
+import { deleteRows, estimateSize, getSizes } from './lib/db';
+import { flushEvents, logEvent } from './lib/events';
+import { appendFreed } from './lib/freedLog';
+import { clusterIdOf, isInCluster, onIndexProgress, setBusyProbe, startIndexer, stopIndexer } from './lib/indexer';
+import { conditionFor, loadStudySettings, onStudyChange } from './lib/study';
+import { computeSummary, loadSummary, saveSummary } from './lib/summary';
+import { isScreenshot, loadProgress, needsExif, PHOTO_DECKS, PHOTO_TYPES, saveProgress, selectForDeck, setClusterLookup } from './lib/progress';
 import {
   albumIdOf, deleteFileAssets, enrichWithExif, fileAssetFromId, getSavedFolder, getScreenshotsAlbum,
   IS_IOS, isAlbumDeck, isFileAsset, listFolderImages,
@@ -39,6 +49,9 @@ import {
 const VIGNETTE_WIDTH = SCREEN_WIDTH * 0.35;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+// The Similar deck also uses the on-device near-duplicate clusters
+setClusterLookup({ isInCluster, clusterIdOf });
+
 const formatDuration = (secs) => {
   if (!secs || secs <= 0) return null;
   const m = Math.floor(secs / 60);
@@ -47,7 +60,7 @@ const formatDuration = (secs) => {
 };
 
 // ─── StoragePill ──────────────────────────────────────────────────────────────
-const StoragePill = ({ savedBytes, totalBytes, onLongPress, targetRef }) => {
+const StoragePill = ({ savedBytes, totalBytes, totalApprox, onPress, onLongPress, targetRef }) => {
   // Always rendered: it's also the long-press target for "start over".
   // Expo Go never reports library file sizes, so the total is often 0 — hide just that part.
   const hasTotal = totalBytes > 0;
@@ -57,18 +70,19 @@ const StoragePill = ({ savedBytes, totalBytes, onLongPress, targetRef }) => {
   return (
     <Pressable
       ref={targetRef}
+      onPress={onPress}
       onLongPress={onLongPress}
       delayLongPress={500}
       hitSlop={8}
       style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
       accessibilityRole="button"
-      accessibilityHint="Long-press to start over this deck"
+      accessibilityHint="Tap for stats, long-press to start over this deck"
     >
       <BlurView intensity={50} tint="dark" style={styles.storagePill}>
         <Ionicons name="cloud-done-outline" size={13} color="rgba(255,255,255,0.55)" />
         <Text style={styles.storageText}>{savedBytes > 0 ? `${toGB(savedBytes)} saved` : 'Nothing in trash'}</Text>
         {hasTotal && <Text style={styles.storageTextDim}>·</Text>}
-        {hasTotal && <Text style={styles.storageTextDim}>{toGB(totalBytes)} total</Text>}
+        {hasTotal && <Text style={styles.storageTextDim}>{totalApprox ? '~' : ''}{toGB(totalBytes)} total</Text>}
       </BlurView>
     </Pressable>
   );
@@ -76,14 +90,15 @@ const StoragePill = ({ savedBytes, totalBytes, onLongPress, targetRef }) => {
 
 // ─── DeckPill ─────────────────────────────────────────────────────────────────
 // Shows the active photo filters; tap opens the filter sheet
-const DeckPill = ({ deck, type, albumTitle, onPress, targetRef }) => {
+const DeckPill = ({ deck, type, sort, albumTitle, onPress, targetRef }) => {
   const current = isAlbumDeck(deck)
     ? { key: deck, label: albumTitle ?? 'Album', icon: 'folder-outline' }
     : PHOTO_DECKS.find(d => d.key === deck) ?? PHOTO_DECKS[0];
   const typeLabel = PHOTO_TYPES.find(t => t.key === type)?.label;
-  const label = type === 'all' ? current.label
+  const base = type === 'all' ? current.label
     : deck === 'all' ? typeLabel
     : `${current.label} · ${typeLabel}`;
+  const label = sort === 'largest' ? `${base} · Largest` : base;
   return (
     <TouchableOpacity ref={targetRef} onPress={onPress} activeOpacity={0.7} accessibilityRole="button" accessibilityLabel={`Photo filters: ${label}`}>
       <BlurView intensity={50} tint="dark" style={styles.storagePill}>
@@ -297,15 +312,39 @@ export default function App() {
   const [mediaMode, setMediaMode] = useState('photo'); // 'photo' | 'video'
   const mediaModeRef = useRef('photo');
 
-  // ── 24h reminder: reschedule on every launch/foreground, log taps ─────────
+  // ── Session lifecycle: study mode, 24h reminder, session events ──────────
+  // Reminder taps are logged; every launch/foreground reschedules the reminder.
+  // `lifecycleRef` is filled in further down once the handlers exist.
+  const sessionRef = useRef({ start: 0, kept: 0, trashed: 0, active: false });
+  const lifecycleRef = useRef({ foreground: () => {}, background: () => {}, studyChanged: () => {} });
   useEffect(() => {
     const unsubscribe = listenForReminderTaps();
-    refreshReminder();
+    const begin = () => {
+      if (sessionRef.current.active) return;
+      sessionRef.current = { start: Date.now(), kept: 0, trashed: 0, active: true };
+      logEvent('session_start');
+      refreshReminder();
+      lifecycleRef.current.foreground();
+    };
+    const end = () => {
+      const s = sessionRef.current;
+      if (!s.active) return;
+      s.active = false;
+      lifecycleRef.current.background();
+      logEvent('session_end', { durationMs: Date.now() - s.start, kept: s.kept, trashed: s.trashed });
+      flushEvents();
+    };
+    loadStudySettings().then(begin);
+    const offStudy = onStudyChange(() => { refreshReminder(); lifecycleRef.current.studyChanged(); });
     const sub = AppState.addEventListener('change', (next) => {
-      if (next === 'active') refreshReminder();
+      if (next === 'active') begin();
+      else if (next === 'background') end();
     });
-    return () => { unsubscribe(); sub.remove(); };
+    return () => { unsubscribe(); offStudy(); sub.remove(); };
   }, []);
+
+  // Library analysis backs off while the user is swiping
+  const lastInteractionRef = useRef(0);
 
   // ── Photo state ────────────────────────────────────────────────────────────
   const [photos, setPhotos] = useState([]);
@@ -370,6 +409,55 @@ export default function App() {
 
   const [resetting, setResetting] = useState(false);
   const [progressBump, setProgressBump] = useState(0); // forces a save after a reset
+
+  // ── Advisory banner (tier 1) ─────────────────────────────────────────────
+  const [advisory, setAdvisory] = useState(null);
+  const advisoryRef = useRef(null);
+  const advisorCheckedRef = useRef(false);   // one decision per session
+  const bannerShownAtRef = useRef(0);
+  const swipesSinceBannerRef = useRef(0);
+
+  // Launch decision: reads only the cached summary from the previous session
+  const runAdvisor = useCallback(async () => {
+    if (advisorCheckedRef.current) return;
+    advisorCheckedRef.current = true;
+    const [summary, state, seenTutorial] = await Promise.all([loadSummary(), loadAdvisorState(), hasSeenTutorial()]);
+    if (!seenTutorial) { logEvent('banner_suppressed', { reason: 'tutorial' }); return; }
+    const d = decide({ summary, state, condition: conditionFor() });
+    if (!d.show) { logEvent('banner_suppressed', { reason: d.reason, pressure: d.pressure }); return; }
+    await recordShown();
+    bannerShownAtRef.current = Date.now();
+    swipesSinceBannerRef.current = 0;
+    advisoryRef.current = d;
+    setAdvisory(d);
+    logEvent('banner_shown', { advisory: d.type, phrasingId: d.phrasingId, pressure: d.pressure, summaryAgeMs: Date.now() - summary.computedAt });
+  }, []);
+
+  // outcome: 'acted' | 'dismissed' | 'ignored'. Returns the closed advisory.
+  const closeAdvisory = useCallback(async (outcome) => {
+    const adv = advisoryRef.current;
+    if (!adv) return null;
+    advisoryRef.current = null;
+    setAdvisory(null);
+    const info = { advisory: adv.type, phrasingId: adv.phrasingId, afterMs: Date.now() - bannerShownAtRef.current };
+    if (outcome === 'acted') {
+      await recordActed();
+      logEvent('banner_acted', info);
+    } else {
+      logEvent(outcome === 'ignored' ? 'banner_ignored' : 'banner_dismissed', { ...info, ...(await recordDismissed()) });
+    }
+    return adv;
+  }, []);
+
+  // ── Stats sheet + library summary ──────────────────────────────────────────
+  const [statsVisible, setStatsVisible] = useState(false);
+  const [librarySummary, setLibrarySummary] = useState(null);
+  useEffect(() => { loadSummary().then((s) => s && setLibrarySummary(s)); }, []);
+
+  // ── Photo sort ('newest' | 'largest') ──────────────────────────────────────
+  const [photoSort, setPhotoSort] = useState('newest');
+  const photoSortRef = useRef('newest');
+  const sizeOrderRef = useRef(null);   // { generation, list, pos } for the largest-first deck
 
   // ── Tutorial ───────────────────────────────────────────────────────────────
   const [tutorialVisible, setTutorialVisible] = useState(false);
@@ -619,6 +707,26 @@ export default function App() {
     return set;
   }, []);
 
+  // Recompute the storage-composition summary from the index (throttled) and cache
+  // it for the next launch's advisory decision
+  const trashQueueRef = useRef([]);
+  useEffect(() => { trashQueueRef.current = trashQueue; }, [trashQueue]);
+  const summaryAtRef = useRef(0);
+  const updateSummary = useCallback(async (force = false) => {
+    if (!force && Date.now() - summaryAtRef.current < 30000) return;
+    summaryAtRef.current = Date.now();
+    try {
+      const summary = await computeSummary({ reviewed: getReviewedSet('photo'), trashed: new Set(trashQueueRef.current) });
+      await saveSummary(summary);
+      setLibrarySummary(summary);
+    } catch {}
+  }, [getReviewedSet]);
+
+  useEffect(() => {
+    setBusyProbe(() => Date.now() - lastInteractionRef.current < 1500);
+    onIndexProgress(() => updateSummary());
+  }, [updateSummary]);
+
   // Restore reviewed IDs and the pending trash queue. Trashed assets are re-fetched
   // so ones deleted outside the app are dropped instead of failing at delete time.
   const restoreProgress = useCallback(async () => {
@@ -680,6 +788,51 @@ export default function App() {
     return { assets: found, endCursor: after, hasNextPage: hasNext };
   }, []);
 
+  // Largest-first order: list the whole deck once per deck load, sort it by the indexed
+  // file sizes (estimated from resolution until measured), then page through that list.
+  const fetchBySize = useCallback(async (generation, isStale, select, album, reviewed, deck) => {
+    let order = sizeOrderRef.current;
+    if (!order || order.generation !== generation) {
+      const list = [];
+      let after;
+      let hasNext = true;
+      while (hasNext) {
+        const media = await MediaLibrary.getAssetsAsync({
+          first: 500, mediaType: 'photo', album: album ?? undefined,
+          sortBy: [[MediaLibrary.SortBy.creationTime, false]], after,
+        });
+        if (isStale()) return null;
+        list.push(...media.assets.filter(a => !reviewed.has(a.id)));
+        after = media.endCursor;
+        hasNext = media.hasNextPage;
+      }
+      if (IS_IOS && deck === 'downloads') {
+        try {
+          const folder = await getSavedFolder();
+          if (folder) list.push(...listFolderImages(folder).filter(a => !reviewed.has(a.id)));
+        } catch {
+          setFolderAccessLost(true);
+        }
+      }
+      const sizes = await getSizes(list.map(a => a.id));
+      if (isStale()) return null;
+      const sizeOf = (a) => sizes.get(a.id)?.size ?? a.fileSize ?? estimateSize('photo', a.width, a.height);
+      list.sort((a, b) => sizeOf(b) - sizeOf(a));
+      order = sizeOrderRef.current = { generation, list, pos: 0 };
+    }
+    const found = [];
+    while (order.pos < order.list.length && found.length < PREFETCH_BATCH) {
+      const chunk = order.list.slice(order.pos, order.pos + PAGE_SIZE);
+      order.pos += chunk.length;
+      if (needsExif(deck)) {
+        await enrichWithExif(chunk.filter(a => !isScreenshot(a)));
+        if (isStale()) return null;
+      }
+      found.push(...select(chunk));
+    }
+    return { assets: found, endCursor: String(order.pos), hasNextPage: order.pos < order.list.length };
+  }, []);
+
   // FIX #3: loadMorePhotos uses ref for hasNextPage guard, not stale closure
   const loadMorePhotos = useCallback(async (cursor = null) => {
     if (!hasNextPageRef.current && cursor !== null) return;
@@ -701,13 +854,17 @@ export default function App() {
       // iOS keeps screenshots in a smart album, so query it directly instead of scanning everything
       if (!album && deck === 'screenshots') album = (await getScreenshotsAlbum())?.id ?? null;
       if (isStale()) return;
-      const page = await fetchUnreviewed('photo', cursor, select, isStale, {
-        // Screenshots never count as camera or download, so skip their EXIF lookup
-        album, reviewed, enrich: needsExif(deck) ? (assets) => enrichWithExif(assets.filter(a => !isScreenshot(a))) : null,
-      });
+      const largest = photoSortRef.current === 'largest' && deck !== 'similar';
+      const page = largest
+        ? await fetchBySize(generation, isStale, select, album, reviewed, deck)
+        : await fetchUnreviewed('photo', cursor, select, isStale, {
+          // Screenshots never count as camera or download, so skip their EXIF lookup
+          album, reviewed, enrich: needsExif(deck) ? (assets) => enrichWithExif(assets.filter(a => !isScreenshot(a))) : null,
+        });
       if (!page) return;
       // iOS Downloads also includes the Files-app folder the user picked, shown first
-      if (IS_IOS && deck === 'downloads' && cursor === null) {
+      // (the largest-first list already includes it)
+      if (IS_IOS && deck === 'downloads' && cursor === null && !largest) {
         const folder = await getSavedFolder();
         if (isStale()) return;
         if (folder) {
@@ -735,7 +892,7 @@ export default function App() {
       // A deck switch mid-load hands the flag to the new load — don't clobber it
       if (!isStale()) loadingMoreRef.current = false;
     }
-  }, [getReviewedSet, fetchUnreviewed]);
+  }, [getReviewedSet, fetchUnreviewed, fetchBySize]);
 
   // FIX #3: loadMoreVideos uses ref for videoHasNextPage guard
   const loadMoreVideos = useCallback(async (cursor = null) => {
@@ -767,6 +924,7 @@ export default function App() {
         await restoreProgress();
         loadMorePhotos();
         loadMoreVideos();
+        startIndexer();
       }
     })();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -834,6 +992,7 @@ export default function App() {
       trashCacheRef.current.photo.set(photo.id, { asset: photo, fileSize });
       setSwipeHistory(prev => [...prev, { dir: 'left', assetId: photo.id, fileSize, asset: photo, generation: deckGenerationRef.current }]);
       setTrashSizeBytes(prev => prev + fileSize);
+      sessionRef.current.trashed++;
     } else {
       const video = card ?? videosRef.current[swiperIndex];
       if (!video?.id) return;
@@ -844,6 +1003,7 @@ export default function App() {
       });
       setVideoSwipeHistory(prev => [...prev, { dir: 'left', assetId: video.id, fileSize }]);
       setVideoTrashSizeBytes(prev => prev + fileSize);
+      sessionRef.current.trashed++;
     }
     playTrash();
   }, [playTrash]);
@@ -856,11 +1016,15 @@ export default function App() {
       const video = card ?? videosRef.current[swiperIndex];
       setVideoSwipeHistory(prev => [...prev, { dir: 'right', assetId: video?.id, fileSize: 0 }]);
     }
+    sessionRef.current.kept++;
     playKeep();
   }, [playKeep]);
 
   // FIX #2: handleSwiped reads pagination state from refs, not stale closure
   const handleSwiped = useCallback((index) => {
+    lastInteractionRef.current = Date.now();
+    // A banner left alone for a few swipes counts as ignored
+    if (advisoryRef.current && ++swipesSinceBannerRef.current >= ADVISOR_RULES.IGNORE_AFTER_SWIPES) closeAdvisory('ignored');
     if (mediaModeRef.current === 'photo') {
       setCardIndex(index + 1);
       resetOverlays();
@@ -912,9 +1076,10 @@ export default function App() {
         });
       }
     }
-  }, [resetOverlays, loadMorePhotos, loadMoreVideos, activePlayer, resetVideoUI]);
+  }, [resetOverlays, loadMorePhotos, loadMoreVideos, activePlayer, resetVideoUI, closeAdvisory]);
 
   const handleSwiping = useCallback((x) => {
+    lastInteractionRef.current = Date.now();
     const threshold = 40;
     if (x < -threshold) {
       trashOpacity.setValue(Math.min(1, (Math.abs(x) - threshold) / 80));
@@ -1085,13 +1250,56 @@ export default function App() {
     loadMorePhotos();
   }, [stashTrashed, commitHistory, resetOverlays, loadMorePhotos]);
 
-  const handleFilterChange = useCallback((deck, type, title) => {
+  const handleFilterChange = useCallback((deck, type, title, sort = photoSortRef.current) => {
     setFilterSheetOpen(false);
     if (title !== undefined) setAlbumTitle(title);
+    // Similar shots only make sense in time order
+    const nextSort = deck === 'similar' ? 'newest' : sort;
     // Reloading restarts the deck, so don't do it for an unchanged selection
-    if (deck === photoDeckRef.current && type === photoTypeRef.current) return;
+    if (deck === photoDeckRef.current && type === photoTypeRef.current && nextSort === photoSortRef.current) return;
+    if (nextSort !== photoSortRef.current) logEvent('sort_used', { sort: nextSort, deck });
+    photoSortRef.current = nextSort;
+    setPhotoSort(nextSort);
+    logEvent('filter_changed', { deck, type, sort: nextSort });
     restartPhotoDeck(deck, type, true);
   }, [restartPhotoDeck]);
+
+  // Banner tapped: open the deck it points at
+  const actOnAdvisory = useCallback(async () => {
+    const adv = await closeAdvisory('acted');
+    if (!adv) return;
+    if (mediaModeRef.current !== 'photo') handleModeChange('photo');
+    handleFilterChange(adv.action.deck, 'all', undefined, adv.action.sort);
+  }, [closeAdvisory, handleModeChange, handleFilterChange]);
+
+  // Session lifecycle hooks (see the effect near the top)
+  useEffect(() => {
+    lifecycleRef.current = {
+      foreground: () => {
+        advisorCheckedRef.current = false;
+        if (hasPermission) {
+          startIndexer();
+          if (photosLoaded) runAdvisor();
+        }
+      },
+      background: () => {
+        stopIndexer();
+        updateSummary(true);
+        if (advisoryRef.current) closeAdvisory('ignored');
+      },
+      studyChanged: () => {
+        if (conditionFor() === 'baseline' && advisoryRef.current) {
+          advisoryRef.current = null;
+          setAdvisory(null);
+        }
+      },
+    };
+  });
+
+  // Launch decision once the first deck is on screen (and the tutorial isn't)
+  useEffect(() => {
+    if (photosLoaded && !tutorialVisible) runAdvisor();
+  }, [photosLoaded, tutorialVisible, runAdvisor]);
 
   // iOS: a Files-app folder was (re)picked — show it under Downloads
   const handleFolderPicked = useCallback(() => {
@@ -1153,6 +1361,7 @@ export default function App() {
               commitHistory('photo');
               const ids = await collectDeckReviewed(deck, photoTypeRef.current, trashQueue);
               for (const id of ids) reviewedBaseRef.current.photo.delete(id);
+              logEvent('deck_reset', { deck, restored: ids.length });
               swipeHistoryRef.current = [];
               setSwipeHistory([]);
               setProgressBump(n => n + 1);
@@ -1186,6 +1395,23 @@ export default function App() {
     ]);
   }, [albumTitle, trashQueue, videoTrashQueue, stashTrashed, commitHistory, collectDeckReviewed, restartPhotoDeck, loadMoreVideos]);
 
+  // Real bytes of the items about to be deleted: the size recorded at swipe time,
+  // then the library index, then the file itself
+  const measureQueue = useCallback(async (mode, queue) => {
+    const history = mode === 'photo' ? swipeHistoryRef.current : videoSwipeHistoryRef.current;
+    const indexed = await getSizes(queue).catch(() => new Map());
+    let bytes = 0;
+    let known = 0;
+    for (const id of queue) {
+      let size = history.find(h => h.assetId === id && h.dir === 'left')?.fileSize
+        || trashCacheRef.current[mode].get(id)?.fileSize || 0;
+      if (!size && indexed.get(id)?.known) size = indexed.get(id).size;
+      if (!size) size = (await fetchAssetInfo(id))?.fileSize || 0;
+      if (size) { bytes += size; known++; } else bytes += indexed.get(id)?.size ?? 0;
+    }
+    return { bytes, known };
+  }, []);
+
   const handleEmptyTrash = useCallback(() => {
     const isPhoto = mediaModeRef.current === 'photo';
     const queue = isPhoto ? trashQueue : videoTrashQueue;
@@ -1194,6 +1420,7 @@ export default function App() {
       { text: 'Cancel', style: 'cancel' },
       { text: 'Delete', style: 'destructive', onPress: async () => {
           try {
+            const freed = await measureQueue(isPhoto ? 'photo' : 'video', queue);
             // Files-app items are plain files; the rest go through the photo library
             const libraryIds = queue.filter(id => !isFileAsset(id));
             if (libraryIds.length) await MediaLibrary.deleteAssetsAsync(libraryIds);
@@ -1206,13 +1433,20 @@ export default function App() {
             } else {
               setVideoTrashQueue([]); setVideoTrashSizeBytes(0); setVideoSwipeHistory([]);
             }
+            const entry = {
+              bytes: freed.bytes, count: queue.length, mode, sizesMeasured: freed.known,
+              deck: isPhoto ? photoDeckRef.current : 'videos', sort: isPhoto ? photoSortRef.current : 'newest',
+            };
+            appendFreed(entry);
+            logEvent('bytes_freed', entry);
+            deleteRows(queue).then(() => updateSummary(true));
           } catch {
             Alert.alert('Error', "Couldn't delete. Check permissions.");
           }
         }
       },
     ]);
-  }, [trashQueue, videoTrashQueue, commitHistory]);
+  }, [trashQueue, videoTrashQueue, commitHistory, measureQueue, updateSummary]);
 
   if (hasPermission === null) return <SplashScreen icon="ellipsis-horizontal" message="Requesting permissions…" />;
   if (hasPermission === false) return <SplashScreen icon="lock-closed-outline" message="No access to camera roll." subtitle="Enable in Settings → Privacy → Photos" />;
@@ -1295,8 +1529,15 @@ export default function App() {
           <MediaToggle mode={mediaMode} onChange={handleModeChange} />
         </View>
         <View style={styles.topBarRow}>
-          <StoragePill savedBytes={activeSavedBytes} totalBytes={totalStorageBytes} onLongPress={handleResetProgress} targetRef={tutorialTargets.storagePill} />
-          {mediaMode === 'photo' && <DeckPill deck={photoDeck} type={photoType} albumTitle={albumTitle} onPress={() => setFilterSheetOpen(true)} targetRef={tutorialTargets.deckPill} />}
+          <StoragePill
+            savedBytes={activeSavedBytes}
+            totalBytes={librarySummary?.totalBytes || totalStorageBytes}
+            totalApprox={!!librarySummary && librarySummary.sizesMeasuredRatio < 0.9}
+            onPress={() => setStatsVisible(true)}
+            onLongPress={handleResetProgress}
+            targetRef={tutorialTargets.storagePill}
+          />
+          {mediaMode === 'photo' && <DeckPill deck={photoDeck} type={photoType} sort={photoSort} albumTitle={albumTitle} onPress={() => setFilterSheetOpen(true)} targetRef={tutorialTargets.deckPill} />}
           {mediaMode === 'video' && (
             <TouchableOpacity onPress={toggleMute} activeOpacity={0.7}>
               <BlurView intensity={50} tint="dark" style={styles.muteButton}>
@@ -1468,10 +1709,18 @@ export default function App() {
 
       {tutorialVisible && <Tutorial targets={tutorialTargets} onDone={closeTutorial} />}
 
+      {advisory && !tutorialVisible && (
+        <AdvisoryBanner advisory={advisory} top={172} onAct={actOnAdvisory} onDismiss={() => closeAdvisory('dismissed')} />
+      )}
+
+      {statsVisible && <StatsSheet onClose={() => setStatsVisible(false)} />}
+      <EmbedderHost />
+
       <PhotoFilterSheet
         visible={filterSheetOpen}
         deck={photoDeck}
         type={photoType}
+        sort={photoSort}
         onChange={handleFilterChange}
         folderAccessLost={folderAccessLost}
         onFolderPicked={handleFolderPicked}

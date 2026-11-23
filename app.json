@@ -44,7 +44,9 @@
       "expo-web-browser",
       "expo-audio",
       "expo-asset",
-      "expo-notifications"
+      "expo-notifications",
+      "expo-sqlite",
+      "expo-sharing"
     ],
     "experiments": {
       "typedRoutes": true,
